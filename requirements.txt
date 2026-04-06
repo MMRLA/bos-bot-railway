@@ -1,3 +1,2 @@
 twisted==23.10.0
-ctrader-open-api==1.0.0
 numpy==1.24.3
