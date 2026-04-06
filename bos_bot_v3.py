@@ -16,6 +16,8 @@ from typing import Optional, List, Dict
 import numpy as np
 
 from ctrader_open_api import Client, Protobuf, TcpProtocol, EndPoints
+
+
 from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAApplicationAuthReq,
     ProtoOAAccountAuthReq,
