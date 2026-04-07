@@ -1,14 +1,10 @@
 """
-IC Markets — EURUSD BOS Reversal Bot v3
-Mejoras sobre v2:
-  - Precarga de 60 barras historicas al arrancar (sin espera de 48h)
-  - Heartbeat cada 30 segundos para ver que el bot esta vivo
-  - Log mas detallado del estado en cada barra
+IC Markets — EURUSD BOS Reversal Bot
 """
+
 
 import logging
 import math
-import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Optional, List, Dict
@@ -16,8 +12,6 @@ from typing import Optional, List, Dict
 import numpy as np
 
 from ctrader_open_api import Client, Protobuf, TcpProtocol, EndPoints
-
-
 from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAApplicationAuthReq,
     ProtoOAAccountAuthReq,
@@ -27,6 +21,8 @@ from ctrader_open_api.messages.OpenApiMessages_pb2 import (
     ProtoOAClosePositionReq,
     ProtoOAReconcileReq,
     ProtoOAGetTrendbarsReq,
+    ProtoOASymbolsListReq,
+    ProtoOAAmendPositionSLTPReq,
 )
 from ctrader_open_api.messages.OpenApiModelMessages_pb2 import (
     ProtoOAOrderType,
@@ -45,8 +41,9 @@ ACCESS_TOKEN  = "gXLkNuEHXOM5UPJ8zDUEstkY8CkFxaLkZN2X441Omn0"
 ACCOUNT_ID    = 45971561
 USE_DEMO      = True
 
-# Parametros del sistema
 SYMBOL_NAME   = "EURUSD"
+DEFAULT_SYMBOL_ID = 1
+
 BAR_SECONDS   = 3600
 EMA_FAST_N    = 12
 EMA_SLOW_N    = 48
@@ -67,15 +64,10 @@ LEVERAGE      = 30
 MAX_MARGIN_PCT= 0.40
 MAX_SPREAD_BP = 3.0
 
-# Cuantas barras historicas pedir al arrancar
-# 60 barras = 60 horas — suficiente para todos los indicadores
 HISTORICAL_BARS = 500
 HISTORICAL_LOOKBACK_DAYS = 14
 
-# Heartbeat: imprimir estado cada N segundos
 HEARTBEAT_SECS = 30
-
-# Timeout para auth de cuenta
 ACCOUNT_AUTH_TIMEOUT_SECS = 10
 
 # =============================================================================
@@ -87,10 +79,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("bos_bot_v3.log", encoding="utf-8"),
+        logging.FileHandler("bos_bot_v5.log", encoding="utf-8"),
     ]
 )
-log = logging.getLogger("BOS_v3")
+log = logging.getLogger("BOS_v5")
 
 # =============================================================================
 # DATACLASSES
@@ -108,8 +100,8 @@ class OpenTrade:
     units:         int
     entry_bar_idx: int
     margin_used:   float
-    entry_time:    datetime = field(
-        default_factory=lambda: datetime.now(timezone.utc))
+    entry_time:    datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    sltp_sent:     bool = False
 
 # =============================================================================
 # ESTADO
@@ -117,31 +109,63 @@ class OpenTrade:
 
 class BotState:
     def __init__(self):
-        self.bars: List[dict]              = []
-        self.max_bars                      = 200
-        self.current_bar: Optional[dict]   = None
+        self.bars: List[dict]                = []
+        self.max_bars                        = 200
+
+        self.current_bar: Optional[dict]     = None
         self.current_bar_start: Optional[int] = None
+        self.current_bar_valid_ticks         = 0
+
         self.open_trades: Dict[int, OpenTrade] = {}
-        self.last_bos_bar                  = -100
-        self.equity                        = 2000.0
-        self.symbol_id                     = 1
-        self.pip_size                      = 0.0001
-        self.trades_total                  = 0
-        self.trades_win                    = 0
-        self.trades_loss                   = 0
-        self.pnl_bp_total                  = 0.0
-        self._pending: Optional[dict]      = None
-        self.historical_loaded             = False
-        self.tick_count                    = 0   # para heartbeat
+        self.last_bos_bar                    = -100
+
+        self.equity                          = 2000.0
+        self.symbol_id                       = DEFAULT_SYMBOL_ID
+        self.symbol_resolved                 = False
+
+        self.pip_size                        = 0.0001
+
+        self.trades_total                    = 0
+        self.trades_win                      = 0
+        self.trades_loss                     = 0
+        self.pnl_bp_total                    = 0.0
+
+        self._pending: Optional[dict]        = None
+        self.historical_loaded               = False
+
+        # Feed / spots
+        self.tick_count                      = 0
+        self.raw_spot_count                  = 0
+        self.spot_reject_spread              = 0
+        self.spot_reject_not_ready           = 0
+        self.spot_ts_fallback_count          = 0
+
+        self.last_spot_ts: Optional[int]     = None
+        self.last_valid_tick_ts: Optional[int] = None
+
+        self.last_bid: Optional[float]       = None
+        self.last_ask: Optional[float]       = None
+        self.last_mid: Optional[float]       = None
+        self.last_spread_bp: Optional[float] = None
+
+        # Counters incrementales heartbeat
+        self.hb_prev_raw_spots               = 0
+        self.hb_prev_valid_ticks             = 0
+        self.hb_prev_reject_spread           = 0
+        self.hb_prev_reject_not_ready        = 0
+        self.hb_prev_ts_fallbacks            = 0
 
     @property
-    def n_bars(self): return len(self.bars)
+    def n_bars(self):
+        return len(self.bars)
 
     @property
-    def bars_since_last_bos(self): return self.n_bars - self.last_bos_bar
+    def bars_since_last_bos(self):
+        return self.n_bars - self.last_bos_bar
 
     @property
-    def n_open_trades(self): return len(self.open_trades)
+    def n_open_trades(self):
+        return len(self.open_trades)
 
     @property
     def total_margin_used(self):
@@ -165,224 +189,420 @@ class BotState:
 state = BotState()
 
 # =============================================================================
+# UTILS
+# =============================================================================
+
+def now_utc_ts() -> int:
+    return int(datetime.now(timezone.utc).timestamp())
+
+def fmt_dt_utc(ts: Optional[int]) -> str:
+    if ts is None:
+        return "NA"
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+def safe_float(x, default=float("nan")):
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def px_to_bp(diff, price):
+    if price is None or price <= 0:
+        return float("nan")
+    return (diff / price) * 10_000.0
+
+def bp_to_price(bp, price):
+    if price is None or price <= 0:
+        return float("nan")
+    return price * bp / 10_000.0
+
+def get_bar_start(ts):
+    return (ts // BAR_SECONDS) * BAR_SECONDS
+
+def normalize_spot_timestamp(raw_ts_ms: Optional[int]) -> int:
+    """
+    Convierte timestamp spot a segundos UTC.
+    Si viene 0, invalido o fuera de rango, usa fallback con hora local UTC actual.
+    """
+    now_ts = now_utc_ts()
+
+    try:
+        if raw_ts_ms is None:
+            state.spot_ts_fallback_count += 1
+            return now_ts
+
+        raw_ts_ms = int(raw_ts_ms)
+
+        if raw_ts_ms <= 0:
+            state.spot_ts_fallback_count += 1
+            return now_ts
+
+        ts = raw_ts_ms // 1000
+
+        # Rango razonable: entre 2000-01-01 y ahora + 1h
+        if ts < 946684800 or ts > now_ts + 3600:
+            state.spot_ts_fallback_count += 1
+            return now_ts
+
+        return ts
+
+    except Exception:
+        state.spot_ts_fallback_count += 1
+        return now_ts
+
+# =============================================================================
 # INDICADORES
 # =============================================================================
 
 def ema_series(values, span):
-    if len(values) < span: return float("nan")
+    if len(values) < span:
+        return float("nan")
     k = 2.0 / (span + 1)
     ema = float(values[0])
-    for v in values[1:]: ema = v * k + ema * (1 - k)
+    for v in values[1:]:
+        ema = v * k + ema * (1 - k)
     return ema
 
 def calc_atr(bars, period):
-    if len(bars) < period + 1: return float("nan")
+    if len(bars) < period + 1:
+        return float("nan")
+
     trs = []
     for i in range(1, len(bars)):
         h, l, pc = bars[i]["high"], bars[i]["low"], bars[i-1]["close"]
-        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+
     atr = float(np.mean(trs[:period]))
-    for tr in trs[period:]: atr = (atr*(period-1)+tr)/period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
     return atr
 
 def calc_adx(bars, period):
-    if len(bars) < period * 2: return float("nan")
+    if len(bars) < period * 2:
+        return float("nan")
+
     plus_dms, minus_dms, trs = [], [], []
+
     for i in range(1, len(bars)):
-        up   = bars[i]["high"] - bars[i-1]["high"]
+        up = bars[i]["high"] - bars[i-1]["high"]
         down = bars[i-1]["low"] - bars[i]["low"]
-        plus_dms.append(up   if (up>down and up>0)   else 0.0)
-        minus_dms.append(down if (down>up and down>0) else 0.0)
+
+        plus_dms.append(up if (up > down and up > 0) else 0.0)
+        minus_dms.append(down if (down > up and down > 0) else 0.0)
+
         h, l, pc = bars[i]["high"], bars[i]["low"], bars[i-1]["close"]
-        trs.append(max(h-l, abs(h-pc), abs(l-pc)))
+        trs.append(max(h - l, abs(h - pc), abs(l - pc)))
+
     def ws(data, n):
-        s = float(np.sum(data[:n])); result = [s]
-        for v in data[n:]: s=s-s/n+v; result.append(s)
+        s = float(np.sum(data[:n]))
+        result = [s]
+        for v in data[n:]:
+            s = s - s / n + v
+            result.append(s)
         return result
-    sm_tr=ws(trs,period); sm_p=ws(plus_dms,period); sm_m=ws(minus_dms,period)
-    dxs=[]
-    for st,sp,sm in zip(sm_tr,sm_p,sm_m):
-        if st<1e-12: continue
-        dip,dim=100*sp/st,100*sm/st
-        denom=dip+dim
-        dxs.append(100*abs(dip-dim)/denom if denom>1e-12 else 0.0)
-    if len(dxs)<period: return float("nan")
-    adx=float(np.mean(dxs[:period]))
-    for dx in dxs[period:]: adx=(adx*(period-1)+dx)/period
+
+    sm_tr = ws(trs, period)
+    sm_p  = ws(plus_dms, period)
+    sm_m  = ws(minus_dms, period)
+
+    dxs = []
+    for st, sp, sm in zip(sm_tr, sm_p, sm_m):
+        if st < 1e-12:
+            continue
+        dip = 100 * sp / st
+        dim = 100 * sm / st
+        denom = dip + dim
+        dxs.append(100 * abs(dip - dim) / denom if denom > 1e-12 else 0.0)
+
+    if len(dxs) < period:
+        return float("nan")
+
+    adx = float(np.mean(dxs[:period]))
+    for dx in dxs[period:]:
+        adx = (adx * (period - 1) + dx) / period
+
     return adx
 
-def px_to_bp(diff, mid): return (diff/mid)*10_000
-
 def compute_indicators():
-    bars=state.bars; n=len(bars); mid=bars[-1]["close"] if bars else 1.1
-    nan=float("nan")
-    r={"ema_fast":nan,"ema_slow":nan,"ltf_side":0,"atr_bp":nan,"adx":nan,
-       "swing_hi":nan,"swing_lo":nan,"swing_range_bp":nan}
-    if n < state.n_bars_needed(): return r
-    closes=[b["close"] for b in bars]
-    r["ema_fast"]=ema_series(closes[-EMA_FAST_N:],EMA_FAST_N)
-    r["ema_slow"]=ema_series(closes[-EMA_SLOW_N:],EMA_SLOW_N)
+    bars = state.bars
+    n = len(bars)
+    mid = bars[-1]["close"] if bars else 1.1
+    nan = float("nan")
+
+    r = {
+        "ema_fast": nan,
+        "ema_slow": nan,
+        "ltf_side": 0,
+        "atr_bp": nan,
+        "adx": nan,
+        "swing_hi": nan,
+        "swing_lo": nan,
+        "swing_range_bp": nan
+    }
+
+    if n < state.n_bars_needed():
+        return r
+
+    closes = [b["close"] for b in bars]
+    r["ema_fast"] = ema_series(closes[-EMA_FAST_N:], EMA_FAST_N)
+    r["ema_slow"] = ema_series(closes[-EMA_SLOW_N:], EMA_SLOW_N)
+
     if not math.isnan(r["ema_fast"]) and not math.isnan(r["ema_slow"]):
-        r["ltf_side"]=1 if r["ema_fast"]>r["ema_slow"] else -1
-    atr_raw=calc_atr(bars[-(ATR_PERIOD+1):],ATR_PERIOD)
-    if not math.isnan(atr_raw): r["atr_bp"]=px_to_bp(atr_raw,mid)
-    r["adx"]=calc_adx(bars[-(ADX_PERIOD*3):],ADX_PERIOD)
-    if n>=SWING_LOOKBACK+1:
-        prev=bars[-(SWING_LOOKBACK+1):-1]
-        r["swing_hi"]=max(b["high"] for b in prev)
-        r["swing_lo"]=min(b["low"]  for b in prev)
-        r["swing_range_bp"]=px_to_bp(r["swing_hi"]-r["swing_lo"],mid)
+        r["ltf_side"] = 1 if r["ema_fast"] > r["ema_slow"] else -1
+
+    atr_raw = calc_atr(bars[-(ATR_PERIOD + 1):], ATR_PERIOD)
+    if not math.isnan(atr_raw):
+        r["atr_bp"] = px_to_bp(atr_raw, mid)
+
+    r["adx"] = calc_adx(bars[-(ADX_PERIOD * 3):], ADX_PERIOD)
+
+    if n >= SWING_LOOKBACK + 1:
+        prev = bars[-(SWING_LOOKBACK + 1):-1]
+        r["swing_hi"] = max(b["high"] for b in prev)
+        r["swing_lo"] = min(b["low"]  for b in prev)
+        r["swing_range_bp"] = px_to_bp(r["swing_hi"] - r["swing_lo"], mid)
+
     return r
 
 # =============================================================================
-# LOGICA BOS
+# LOGICA BOS (SIN CAMBIAR ESTRATEGIA)
 # =============================================================================
 
 def evaluate_bos_signal(ind, bar):
-    close=bar["close"]
-    for key in ["ema_fast","ema_slow","atr_bp","adx","swing_hi","swing_lo","swing_range_bp"]:
-        if math.isnan(ind.get(key,float("nan"))): return None
-    if ind["swing_range_bp"] < MIN_SWING_BP: return None
-    if ind["atr_bp"]         < ATR_MIN_BP:   return None
-    if ind["adx"]            < ADX_MIN_VAL:  return None
-    if state.bars_since_last_bos < COOLDOWN_BARS: return None
-    bar_dt=datetime.fromtimestamp(bar["time"],tz=timezone.utc)
-    if bar_dt.weekday()==6: return None
-    if bar_dt.weekday()==4 and bar_dt.hour>=20: return None
-    ltf=ind["ltf_side"]
-    if ltf==1  and close>ind["swing_hi"]:
+    close = bar["close"]
+
+    for key in ["ema_fast", "ema_slow", "atr_bp", "adx", "swing_hi", "swing_lo", "swing_range_bp"]:
+        if math.isnan(ind.get(key, float("nan"))):
+            return None
+
+    if ind["swing_range_bp"] < MIN_SWING_BP:
+        return None
+    if ind["atr_bp"] < ATR_MIN_BP:
+        return None
+    if ind["adx"] < ADX_MIN_VAL:
+        return None
+    if state.bars_since_last_bos < COOLDOWN_BARS:
+        return None
+
+    bar_dt = datetime.fromtimestamp(bar["time"], tz=timezone.utc)
+    if bar_dt.weekday() == 6:
+        return None
+    if bar_dt.weekday() == 4 and bar_dt.hour >= 20:
+        return None
+
+    ltf = ind["ltf_side"]
+
+    # Estrategia original: reversal del breakout
+    if ltf == 1 and close > ind["swing_hi"]:
         log.info(f"  BOS ALCISTA: {close:.5f} > swing_hi={ind['swing_hi']:.5f}")
         return "sell"
-    if ltf==-1 and close<ind["swing_lo"]:
+
+    if ltf == -1 and close < ind["swing_lo"]:
         log.info(f"  BOS BAJISTA: {close:.5f} < swing_lo={ind['swing_lo']:.5f}")
         return "buy"
+
     return None
 
+# =============================================================================
+# RIESGO / SIZING / SLTP
+# =============================================================================
+
 def calc_sl_tp(side, entry, atr_bp):
-    sl_bp=max(SL_MIN_BP,min(SL_MAX_BP,atr_bp*ATR_MULT))
-    tp_bp=sl_bp*TP_RATIO
-    sl_d=sl_bp*state.pip_size; tp_d=tp_bp*state.pip_size
-    if side=="sell": return entry+sl_d, entry-tp_d, sl_bp, tp_bp
-    else:            return entry-sl_d, entry+tp_d, sl_bp, tp_bp
+    sl_bp = max(SL_MIN_BP, min(SL_MAX_BP, atr_bp * ATR_MULT))
+    tp_bp = sl_bp * TP_RATIO
+
+    sl_d = bp_to_price(sl_bp, entry)
+    tp_d = bp_to_price(tp_bp, entry)
+
+    if side == "sell":
+        return entry + sl_d, entry - tp_d, sl_bp, tp_bp
+    else:
+        return entry - sl_d, entry + tp_d, sl_bp, tp_bp
 
 def calc_units(sl_bp, entry_price):
-    risk_eur=state.equity*RISK_PCT
-    units=max(1000,int(risk_eur/(sl_bp*state.pip_size)/1000)*1000)
-    margin=units*entry_price/LEVERAGE
+    risk_eur = state.equity * RISK_PCT
+    sl_return = sl_bp / 10_000.0
+
+    if sl_return <= 0:
+        return 0, 0.0
+
+    units_float = risk_eur / sl_return
+    units = max(1000, int(units_float / 1000) * 1000)
+
+    margin = units * entry_price / LEVERAGE
     return units, margin
 
 def execute_signal(signal, bar, ind, bot):
-    entry=bar["ask"] if signal=="buy" else bar["bid"]
-    sl_price,tp_price,sl_bp,tp_bp=calc_sl_tp(signal,entry,ind["atr_bp"])
-    units,margin_needed=calc_units(sl_bp,entry)
-    if margin_needed>state.margin_available:
-        log.warning(f"  SEÑAL OMITIDA: margen insuficiente "
-                    f"(necesario={margin_needed:.0f}€, disponible={state.margin_available:.0f}€)")
+    entry = bar["ask"] if signal == "buy" else bar["bid"]
+
+    sl_price, tp_price, sl_bp, tp_bp = calc_sl_tp(signal, entry, ind["atr_bp"])
+    units, margin_needed = calc_units(sl_bp, entry)
+
+    if units <= 0:
+        log.warning("  SEÑAL OMITIDA: sizing invalido (units<=0)")
         return
-    log.info(f"\n  *** {signal.upper()} | Entry={entry:.5f} "
-             f"SL={sl_price:.5f}({sl_bp:.1f}bp) TP={tp_price:.5f}({tp_bp:.1f}bp) "
-             f"Units={units:,} Margen={margin_needed:.0f}€ ***")
-    state._pending={
-        "side":signal,"entry_price":entry,"sl_price":sl_price,"tp_price":tp_price,
-        "sl_bp":sl_bp,"tp_bp":tp_bp,"units":units,"margin":margin_needed,
-        "entry_bar_idx":state.n_bars}
-    state.last_bos_bar=state.n_bars
-    bot.send_order(signal,units,sl_price,tp_price)
+
+    if margin_needed > state.margin_available:
+        log.warning(
+            f"  SEÑAL OMITIDA: margen insuficiente "
+            f"(necesario={margin_needed:.0f}€, disponible={state.margin_available:.0f}€)"
+        )
+        return
+
+    spread_bp = px_to_bp((bar["ask"] - bar["bid"]), bar["bid"])
+    log.info(
+        f"\n  *** {signal.upper()} PRE-ORDER | "
+        f"EntryRef={entry:.5f} | Spread={spread_bp:.2f}bp | "
+        f"SL={sl_price:.5f} ({sl_bp:.1f}bp) | "
+        f"TP={tp_price:.5f} ({tp_bp:.1f}bp) | "
+        f"Units={units:,} | Margen={margin_needed:.0f}€ ***"
+    )
+
+    state._pending = {
+        "side": signal,
+        "entry_price_ref": entry,
+        "sl_bp": sl_bp,
+        "tp_bp": tp_bp,
+        "units": units,
+        "margin": margin_needed,
+        "entry_bar_idx": state.n_bars,
+        "signal_bar_time": bar["time"],
+        "signal_bid": bar["bid"],
+        "signal_ask": bar["ask"],
+    }
+
+    state.last_bos_bar = state.n_bars
+    bot.send_order(signal, units)
 
 # =============================================================================
 # BARRAS
 # =============================================================================
 
-def get_bar_start(ts): return (ts//BAR_SECONDS)*BAR_SECONDS
-
 def finalize_current_bar(bot):
     if state.current_bar is None or state.current_bar_start is None:
         return
 
-    completed=dict(state.current_bar)
+    completed = dict(state.current_bar)
     if completed.get("time", 0) <= 0:
         log.warning("Barra invalida detectada; se omite el cierre.")
         return
 
     state.add_bar(completed)
-    bar_dt=datetime.fromtimestamp(completed["time"],tz=timezone.utc)
+    bar_dt = datetime.fromtimestamp(completed["time"], tz=timezone.utc)
 
-    log.info(f"\n{'='*65}")
+    log.info(f"\n{'='*78}")
     log.info(f"BARRA CERRADA: {bar_dt.strftime('%Y-%m-%d %H:%M')} UTC")
-    log.info(f"  O={completed['open']:.5f} H={completed['high']:.5f} "
-             f"L={completed['low']:.5f} C={completed['close']:.5f}")
-    log.info(f"  Barras acumuladas: {state.n_bars} | "
-             f"Trades abiertos: {state.n_open_trades} | "
-             f"PnL: {state.pnl_bp_total:+.1f}bp")
+    log.info(
+        f"  O={completed['open']:.5f} H={completed['high']:.5f} "
+        f"L={completed['low']:.5f} C={completed['close']:.5f} | "
+        f"ticks_validos={state.current_bar_valid_ticks}"
+    )
+    log.info(
+        f"  Barras acumuladas: {state.n_bars} | "
+        f"Trades abiertos: {state.n_open_trades} | "
+        f"PnL total: {state.pnl_bp_total:+.1f}bp"
+    )
+
+    if state.current_bar_valid_ticks <= 1:
+        log.warning("  AVISO: la barra se ha construido con 0/1 ticks validos. Revisa feed/spread/symbolId.")
 
     on_bar_close(completed, bot)
 
 def on_tick(bid, ask, ts, bot):
     state.tick_count += 1
-    mid=(bid+ask)/2
-    bar_start=get_bar_start(ts)
+    state.last_valid_tick_ts = ts
+
+    mid = (bid + ask) / 2.0
+    bar_start = get_bar_start(ts)
 
     if state.current_bar_start is None:
-        state.current_bar_start=bar_start
-        state.current_bar={"time":bar_start,"open":mid,"high":mid,
-                           "low":mid,"close":mid,"bid":bid,"ask":ask}
+        state.current_bar_start = bar_start
+        state.current_bar = {
+            "time": bar_start,
+            "open": mid,
+            "high": mid,
+            "low": mid,
+            "close": mid,
+            "bid": bid,
+            "ask": ask,
+        }
+        state.current_bar_valid_ticks = 1
         return
 
     if bar_start < state.current_bar_start:
         return
 
-    if bar_start==state.current_bar_start:
-        cb=state.current_bar
-        cb["high"]=max(cb["high"],mid); cb["low"]=min(cb["low"],mid)
-        cb["close"]=mid; cb["bid"]=bid; cb["ask"]=ask
+    if bar_start == state.current_bar_start:
+        cb = state.current_bar
+        cb["high"] = max(cb["high"], mid)
+        cb["low"]  = min(cb["low"], mid)
+        cb["close"] = mid
+        cb["bid"] = bid
+        cb["ask"] = ask
+        state.current_bar_valid_ticks += 1
     else:
         finalize_current_bar(bot)
 
-        state.current_bar_start=bar_start
-        state.current_bar={"time":bar_start,"open":mid,"high":mid,
-                           "low":mid,"close":mid,"bid":bid,"ask":ask}
+        state.current_bar_start = bar_start
+        state.current_bar = {
+            "time": bar_start,
+            "open": mid,
+            "high": mid,
+            "low": mid,
+            "close": mid,
+            "bid": bid,
+            "ask": ask,
+        }
+        state.current_bar_valid_ticks = 1
 
 def on_bar_close(bar, bot):
-    # Cerrar trades por horizonte maximo
-    to_close=[]
-    for pid,trade in state.open_trades.items():
-        bars_open=state.n_bars-trade.entry_bar_idx
-        if bars_open>=MAX_BARS_OPEN:
+    to_close = []
+    for pid, trade in state.open_trades.items():
+        bars_open = state.n_bars - trade.entry_bar_idx
+        if bars_open >= MAX_BARS_OPEN:
             log.warning(f"  Trade {pid}: horizonte max ({MAX_BARS_OPEN}h) — cerrando")
             to_close.append(pid)
+
     for pid in to_close:
         bot.close_position(pid)
 
-    # Evaluar señal
-    needed=state.n_bars_needed()
+    needed = state.n_bars_needed()
     if not state.is_warmed_up():
-        faltan=needed-state.n_bars
-        log.info(f"  Calentando: {state.n_bars}/{needed} barras "
-                 f"(faltan {faltan} barras = {faltan}h)")
+        faltan = needed - state.n_bars
+        log.info(f"  Calentando: {state.n_bars}/{needed} barras (faltan {faltan} barras = {faltan}h)")
         return
 
-    ind=compute_indicators()
-    side_str="▲UP" if ind["ltf_side"]==1 else "▼DOWN"
-    log.info(f"  EMA_f={ind['ema_fast']:.5f} EMA_s={ind['ema_slow']:.5f} {side_str} | "
-             f"ATR={ind['atr_bp']:.1f}bp | ADX={ind['adx']:.1f} | "
-             f"Swing [{ind['swing_lo']:.5f}-{ind['swing_hi']:.5f}]")
+    ind = compute_indicators()
+    side_str = "▲UP" if ind["ltf_side"] == 1 else "▼DOWN"
+    log.info(
+        f"  EMA_f={ind['ema_fast']:.5f} EMA_s={ind['ema_slow']:.5f} {side_str} | "
+        f"ATR={ind['atr_bp']:.1f}bp | ADX={ind['adx']:.1f} | "
+        f"Swing [{ind['swing_lo']:.5f}-{ind['swing_hi']:.5f}] ({ind['swing_range_bp']:.1f}bp)"
+    )
 
-    signal=evaluate_bos_signal(ind,bar)
+    signal = evaluate_bos_signal(ind, bar)
     if signal:
-        execute_signal(signal,bar,ind,bot)
+        execute_signal(signal, bar, ind, bot)
     else:
-        # Mostrar por que no se opera (si los indicadores son validos)
-        if not math.isnan(ind["atr_bp"]):
-            reasons=[]
-            if ind["atr_bp"]         < ATR_MIN_BP:   reasons.append(f"ATR={ind['atr_bp']:.1f}<{ATR_MIN_BP}")
-            if ind["adx"]            < ADX_MIN_VAL:  reasons.append(f"ADX={ind['adx']:.1f}<{ADX_MIN_VAL}")
-            if ind["swing_range_bp"] < MIN_SWING_BP: reasons.append(f"swing={ind['swing_range_bp']:.1f}bp<{MIN_SWING_BP}")
-            if state.bars_since_last_bos < COOLDOWN_BARS: reasons.append("cooldown")
-            if not reasons: reasons.append("sin BOS")
-            log.info(f"  Sin señal: {' | '.join(reasons)}")
+        reasons = []
+        if not math.isnan(ind["atr_bp"]) and ind["atr_bp"] < ATR_MIN_BP:
+            reasons.append(f"ATR={ind['atr_bp']:.1f}<{ATR_MIN_BP}")
+        if not math.isnan(ind["adx"]) and ind["adx"] < ADX_MIN_VAL:
+            reasons.append(f"ADX={ind['adx']:.1f}<{ADX_MIN_VAL}")
+        if not math.isnan(ind["swing_range_bp"]) and ind["swing_range_bp"] < MIN_SWING_BP:
+            reasons.append(f"swing={ind['swing_range_bp']:.1f}bp<{MIN_SWING_BP}")
+        if state.bars_since_last_bos < COOLDOWN_BARS:
+            reasons.append("cooldown")
+        if not reasons:
+            reasons.append("sin BOS")
 
-    log.info(f"  Margen: {state.total_margin_used:.0f}€/{state.equity*MAX_MARGIN_PCT:.0f}€ "
-             f"| Stats: {state.trades_total}T WR={state.trades_win/max(state.trades_total,1)*100:.0f}%")
+        log.info(f"  Sin señal: {' | '.join(reasons)}")
+
+    wr = state.trades_win / max(state.trades_total, 1) * 100
+    log.info(
+        f"  Margen: {state.total_margin_used:.0f}€/{state.equity * MAX_MARGIN_PCT:.0f}€ | "
+        f"Stats: {state.trades_total}T WR={wr:.0f}%"
+    )
 
 # =============================================================================
 # CLIENTE CTRADER
@@ -390,19 +610,22 @@ def on_bar_close(bar, bot):
 
 class BosBot:
     def __init__(self):
-        host=EndPoints.PROTOBUF_DEMO_HOST if USE_DEMO else EndPoints.PROTOBUF_LIVE_HOST
-        self.client=Client(host,EndPoints.PROTOBUF_PORT,TcpProtocol)
+        host = EndPoints.PROTOBUF_DEMO_HOST if USE_DEMO else EndPoints.PROTOBUF_LIVE_HOST
+        self.client = Client(host, EndPoints.PROTOBUF_PORT, TcpProtocol)
         self.client.setConnectedCallback(self._on_connected)
         self.client.setDisconnectedCallback(self._on_disconnected)
         self.client.setMessageReceivedCallback(self._on_message)
-        self.account_auth_ok=False
-        self.heartbeat_started=False
-        self.hourly_timer_started=False
-        self.ready_for_ticks=False
-        self.last_bid=None
-        self.last_ask=None
-        self.last_ts=None
-        log.info(f"Bot v3 inicializado | Servidor: {host}")
+
+        self.account_auth_ok = False
+        self.heartbeat_started = False
+        self.hourly_timer_started = False
+        self.ready_for_ticks = False
+
+        self.last_bid = None
+        self.last_ask = None
+        self.last_ts = None
+
+        log.info(f"Bot v5 inicializado | Servidor: {host}")
 
     def _connect(self):
         self.client.startService()
@@ -411,15 +634,36 @@ class BosBot:
         state.bars = []
         state.current_bar = None
         state.current_bar_start = None
+        state.current_bar_valid_ticks = 0
+
         state.historical_loaded = False
+
         state.tick_count = 0
+        state.raw_spot_count = 0
+        state.spot_reject_spread = 0
+        state.spot_reject_not_ready = 0
+        state.spot_ts_fallback_count = 0
+
+        state.last_spot_ts = None
+        state.last_valid_tick_ts = None
+        state.last_bid = None
+        state.last_ask = None
+        state.last_mid = None
+        state.last_spread_bp = None
+
+        state.hb_prev_raw_spots = 0
+        state.hb_prev_valid_ticks = 0
+        state.hb_prev_reject_spread = 0
+        state.hb_prev_reject_not_ready = 0
+        state.hb_prev_ts_fallbacks = 0
+
         self.ready_for_ticks = False
         self.last_bid = None
         self.last_ask = None
         self.last_ts = None
 
     def _seed_current_bar_after_historical(self, fallback_close):
-        now_ts = self.last_ts if self.last_ts is not None else int(datetime.now(timezone.utc).timestamp())
+        now_ts = self.last_ts if self.last_ts is not None else now_utc_ts()
         bar_start = get_bar_start(now_ts)
 
         if self.last_bid is not None and self.last_ask is not None:
@@ -441,6 +685,7 @@ class BosBot:
             "bid": bid,
             "ask": ask,
         }
+        state.current_bar_valid_ticks = 0
 
     def _schedule_hourly_bar_timer(self):
         if self.hourly_timer_started:
@@ -449,7 +694,7 @@ class BosBot:
         self.hourly_timer_started = True
 
         def schedule_next():
-            now_ts = int(datetime.now(timezone.utc).timestamp())
+            now_ts = now_utc_ts()
             secs_to_next = BAR_SECONDS - (now_ts % BAR_SECONDS)
             if secs_to_next <= 0:
                 secs_to_next = BAR_SECONDS
@@ -470,7 +715,7 @@ class BosBot:
         if state.current_bar is None or state.current_bar_start is None:
             return
 
-        now_ts = int(datetime.now(timezone.utc).timestamp())
+        now_ts = now_utc_ts()
         current_hour_start = get_bar_start(now_ts)
 
         if state.current_bar_start < current_hour_start:
@@ -495,13 +740,14 @@ class BosBot:
                 "bid": bid,
                 "ask": ask,
             }
+            state.current_bar_valid_ticks = 0
             log.info("Timer UTC: cierre/rollover horario H1 ejecutado.")
 
     def _on_connected(self, client):
         log.info("Conectado. Autenticando aplicacion...")
-        req=ProtoOAApplicationAuthReq()
-        req.clientId=CLIENT_ID
-        req.clientSecret=CLIENT_SECRET
+        req = ProtoOAApplicationAuthReq()
+        req.clientId = CLIENT_ID
+        req.clientSecret = CLIENT_SECRET
         client.send(req).addErrback(self._on_error)
 
     def _on_disconnected(self, client, reason):
@@ -523,12 +769,12 @@ class BosBot:
         return obj.__class__.__name__ if obj is not None else "Unknown"
 
     def _extract_account_ids(self, res):
-        account_ids=[]
+        account_ids = []
 
         for attr in ("ctidTraderAccountId", "accountId", "accountIds"):
             if hasattr(res, attr):
                 try:
-                    vals=list(getattr(res, attr))
+                    vals = list(getattr(res, attr))
                     for v in vals:
                         try:
                             account_ids.append(int(v))
@@ -540,9 +786,9 @@ class BosBot:
         for attr in ("ctidTraderAccount", "traderAccount", "account", "accounts"):
             if hasattr(res, attr):
                 try:
-                    items=list(getattr(res, attr))
+                    items = list(getattr(res, attr))
                 except Exception:
-                    items=[]
+                    items = []
                 for item in items:
                     for key in ("ctidTraderAccountId", "accountId"):
                         if hasattr(item, key):
@@ -552,8 +798,8 @@ class BosBot:
                             except Exception:
                                 pass
 
-        unique_ids=[]
-        seen=set()
+        unique_ids = []
+        seen = set()
         for x in account_ids:
             if x not in seen:
                 unique_ids.append(x)
@@ -562,32 +808,85 @@ class BosBot:
 
     def _request_account_list(self):
         log.info("App autenticada. Solicitando cuentas asociadas al token...")
-        req=ProtoOAGetAccountListByAccessTokenReq()
-        req.accessToken=ACCESS_TOKEN
+        req = ProtoOAGetAccountListByAccessTokenReq()
+        req.accessToken = ACCESS_TOKEN
         self.client.send(req).addErrback(self._on_error)
 
     def _authenticate_account(self):
         log.info(f"Autenticando cuenta {ACCOUNT_ID}...")
-        self.account_auth_ok=False
-        req=ProtoOAAccountAuthReq()
-        req.ctidTraderAccountId=ACCOUNT_ID
-        req.accessToken=ACCESS_TOKEN
+        self.account_auth_ok = False
+        req = ProtoOAAccountAuthReq()
+        req.ctidTraderAccountId = ACCOUNT_ID
+        req.accessToken = ACCESS_TOKEN
         self.client.send(req).addErrback(self._on_error)
         reactor.callLater(ACCOUNT_AUTH_TIMEOUT_SECS, self._check_account_auth_timeout)
 
     def _check_account_auth_timeout(self):
         if not self.account_auth_ok:
-            log.error("Timeout esperando autenticacion de cuenta. "
-                      "Revisa ACCESS_TOKEN, ACCOUNT_ID y asociacion token-cuenta.")
+            log.error("Timeout esperando autenticacion de cuenta. Revisa ACCESS_TOKEN, ACCOUNT_ID y asociacion token-cuenta.")
+
+    def _request_symbols_list(self):
+        req = ProtoOASymbolsListReq()
+        req.ctidTraderAccountId = ACCOUNT_ID
+        req.includeArchivedSymbols = False
+        self.client.send(req).addErrback(self._on_error)
+        log.info(f"Solicitando lista de simbolos para resolver {SYMBOL_NAME}...")
+
+    def _extract_symbol_text_candidates(self, sym):
+        texts = []
+        for attr in (
+            "symbolName", "symbol", "name", "displayName",
+            "description", "shortName", "title"
+        ):
+            if hasattr(sym, attr):
+                val = getattr(sym, attr)
+                if isinstance(val, str) and val.strip():
+                    texts.append(val.strip())
+        return texts
+
+    def _resolve_symbol_from_response(self, res):
+        symbols = []
+        try:
+            symbols = list(res.symbol)
+        except Exception:
+            symbols = []
+
+        target = SYMBOL_NAME.upper().replace("/", "")
+
+        exact_matches = []
+        loose_matches = []
+
+        for sym in symbols:
+            symbol_id = getattr(sym, "symbolId", None)
+            texts = self._extract_symbol_text_candidates(sym)
+
+            norm_texts = [t.upper().replace("/", "").replace("_", "").replace("-", "") for t in texts]
+            for nt, raw in zip(norm_texts, texts):
+                if nt == target:
+                    exact_matches.append((symbol_id, raw))
+                elif target in nt:
+                    loose_matches.append((symbol_id, raw))
+
+        if exact_matches:
+            sid, raw = exact_matches[0]
+            return int(sid), raw
+
+        if loose_matches:
+            sid, raw = loose_matches[0]
+            return int(sid), raw
+
+        return None, None
 
     def _on_message(self, client, message):
-        t=message.payloadType
-        obj=self._safe_extract(message)
-        obj_name=self._obj_name(obj)
+        t = message.payloadType
+        obj = self._safe_extract(message)
+        obj_name = self._obj_name(obj)
 
-        log.info(f"[MSG] payloadType={t} type={obj_name}")
+        if not (t == 2131 or obj_name == "ProtoOASpotEvent"):
+            if obj_name not in ("Unknown",):
+                log.info(f"[MSG] payloadType={t} type={obj_name}")
 
-        if t==50 or obj_name=="ProtoOAErrorRes":
+        if t == 50 or obj_name == "ProtoOAErrorRes":
             log.error(
                 "Error servidor | "
                 f"payloadType={t} | "
@@ -597,12 +896,12 @@ class BosBot:
             )
             return
 
-        if t==2101 or obj_name=="ProtoOAApplicationAuthRes":
+        if t == 2101 or obj_name == "ProtoOAApplicationAuthRes":
             self._request_account_list()
             return
 
-        if obj_name=="ProtoOAGetAccountListByAccessTokenRes":
-            account_ids=self._extract_account_ids(obj)
+        if obj_name == "ProtoOAGetAccountListByAccessTokenRes":
+            account_ids = self._extract_account_ids(obj)
             if account_ids:
                 log.info(f"Cuentas asociadas al token: {account_ids}")
                 if ACCOUNT_ID not in account_ids:
@@ -610,75 +909,157 @@ class BosBot:
                     log.error("Corrige ACCOUNT_ID o genera un ACCESS_TOKEN de la cuenta correcta.")
                     return
             else:
-                log.warning("No se pudieron extraer cuentas del token desde la respuesta. "
-                            "Intentando autenticar la cuenta configurada igualmente.")
+                log.warning("No se pudieron extraer cuentas del token desde la respuesta. Intentando autenticar la cuenta configurada igualmente.")
+
             self._authenticate_account()
             return
 
-        if t==2103 or obj_name=="ProtoOAAccountAuthRes":
-            self.account_auth_ok=True
+        if t == 2103 or obj_name == "ProtoOAAccountAuthRes":
+            self.account_auth_ok = True
             self._reset_market_state()
             log.info(f"Cuenta {ACCOUNT_ID} autenticada correctamente.")
-            if state.symbol_id == 1:
-                log.warning("state.symbol_id sigue valiendo 1. "
-                            "Si no llegan spots/historico, revisa que el symbolId de EURUSD sea el correcto en esta cuenta.")
+
+            self._request_symbols_list()
+
+            if not self.heartbeat_started:
+                self._start_heartbeat()
+                self.heartbeat_started = True
+
+            if not self.hourly_timer_started:
+                self._schedule_hourly_bar_timer()
+
+            return
+
+        if obj_name == "ProtoOASymbolsListRes":
+            sid, raw = self._resolve_symbol_from_response(obj)
+            if sid is not None:
+                state.symbol_id = sid
+                state.symbol_resolved = True
+                log.info(f"Symbol resuelto: {SYMBOL_NAME} -> symbolId={sid} (match='{raw}')")
+            else:
+                state.symbol_id = DEFAULT_SYMBOL_ID
+                state.symbol_resolved = False
+                log.warning(
+                    f"No se pudo resolver {SYMBOL_NAME} por nombre. "
+                    f"Usando fallback symbolId={DEFAULT_SYMBOL_ID}. "
+                    f"Si no llegan spots/historico, revisa este punto."
+                )
+
             self._reconcile()
             self._load_historical_bars()
             self._subscribe_spots()
-            if not self.heartbeat_started:
-                self._start_heartbeat()
-                self.heartbeat_started=True
-            if not self.hourly_timer_started:
-                self._schedule_hourly_bar_timer()
             return
 
-        if t==2138 or obj_name=="ProtoOAGetTrendbarsRes":
+        if t == 2138 or obj_name == "ProtoOAGetTrendbarsRes":
             self._on_historical_bars(message)
             return
 
-        if t==2131 or obj_name=="ProtoOASpotEvent":
+        if t == 2131 or obj_name == "ProtoOASpotEvent":
             self._on_spot(message)
             return
 
-        if t==2126 or obj_name=="ProtoOAExecutionEvent":
+        if t == 2126 or obj_name == "ProtoOAExecutionEvent":
             self._on_execution(message)
             return
 
-        if t==2125 or obj_name=="ProtoOAReconcileRes":
+        if t == 2125 or obj_name == "ProtoOAReconcileRes":
             self._on_reconcile(message)
             return
 
-    # ------------------------------------------------------------------
-    # HEARTBEAT — imprime estado cada 30 segundos
-    # ------------------------------------------------------------------
     def _start_heartbeat(self):
         def heartbeat():
-            now=datetime.now(timezone.utc).strftime("%H:%M:%S")
-            needed=state.n_bars_needed()
-            mid=state.current_bar["close"] if state.current_bar else 0.0
-            barra_actual=""
-            if state.current_bar_start is not None:
-                prox=state.current_bar_start+BAR_SECONDS
-                secs_left=prox-int(datetime.now(timezone.utc).timestamp())
-                barra_actual=f" | Prox.barra en {max(0,secs_left//60)}m{max(0,secs_left%60)}s"
+            now = datetime.now(timezone.utc).strftime("%H:%M:%S")
+            needed = state.n_bars_needed()
 
-            if not state.is_warmed_up():
-                faltan=needed-state.n_bars
-                log.info(f"[{now}] CALENTANDO {state.n_bars}/{needed} barras "
-                         f"(~{faltan}h para operar) | "
-                         f"Precio={mid:.5f} | Ticks={state.tick_count}{barra_actual}")
+            hb_raw = state.raw_spot_count - state.hb_prev_raw_spots
+            hb_valid = state.tick_count - state.hb_prev_valid_ticks
+            hb_rej_spread = state.spot_reject_spread - state.hb_prev_reject_spread
+            hb_rej_not_ready = state.spot_reject_not_ready - state.hb_prev_reject_not_ready
+            hb_ts_fallbacks = state.spot_ts_fallback_count - state.hb_prev_ts_fallbacks
+
+            state.hb_prev_raw_spots = state.raw_spot_count
+            state.hb_prev_valid_ticks = state.tick_count
+            state.hb_prev_reject_spread = state.spot_reject_spread
+            state.hb_prev_reject_not_ready = state.spot_reject_not_ready
+            state.hb_prev_ts_fallbacks = state.spot_ts_fallback_count
+
+            now_ts = now_utc_ts()
+            secs_since_last_spot = None if state.last_spot_ts is None else now_ts - state.last_spot_ts
+            secs_since_last_valid = None if state.last_valid_tick_ts is None else now_ts - state.last_valid_tick_ts
+
+            prox_bar_txt = ""
+            if state.current_bar_start is not None:
+                prox = state.current_bar_start + BAR_SECONDS
+                secs_left = prox - now_ts
+                prox_bar_txt = f"{max(0, secs_left//60)}m{max(0, secs_left%60)}s"
+
+            mid_live = state.last_mid if state.last_mid is not None else 0.0
+            bid_live = state.last_bid if state.last_bid is not None else 0.0
+            ask_live = state.last_ask if state.last_ask is not None else 0.0
+            spread_live = state.last_spread_bp if state.last_spread_bp is not None else float("nan")
+
+            if state.current_bar is not None:
+                cb = state.current_bar
+                bar_txt = (
+                    f"O={cb['open']:.5f} H={cb['high']:.5f} "
+                    f"L={cb['low']:.5f} C={cb['close']:.5f} "
+                    f"| ticks_bar={state.current_bar_valid_ticks}"
+                )
+                bar_age = now_ts - state.current_bar_start
+                bar_age_txt = f"{bar_age//60}m{bar_age%60}s"
             else:
-                log.info(f"[{now}] ACTIVO | Precio={mid:.5f} | "
-                         f"Barras={state.n_bars} | Trades={state.n_open_trades} | "
-                         f"PnL={state.pnl_bp_total:+.1f}bp{barra_actual}")
+                bar_txt = "sin barra actual"
+                bar_age_txt = "NA"
+
+            flags = []
+            if secs_since_last_spot is not None and secs_since_last_spot > 10:
+                flags.append(f"ultimo_spot_hace_{secs_since_last_spot}s")
+            if secs_since_last_valid is not None and secs_since_last_valid > 10:
+                flags.append(f"ultimo_tick_valido_hace_{secs_since_last_valid}s")
+            if not math.isnan(spread_live) and spread_live > MAX_SPREAD_BP:
+                flags.append(f"spread_alto={spread_live:.2f}bp")
+            if hb_ts_fallbacks > 0:
+                flags.append(f"ts_fallbacks(+30s)={hb_ts_fallbacks}")
+
+            log.info(
+                f"[{now}] FEED | bid={bid_live:.5f} ask={ask_live:.5f} mid={mid_live:.5f} "
+                f"| spread={spread_live:.2f}bp | raw_spots(+30s)={hb_raw} "
+                f"| valid_ticks(+30s)={hb_valid} | rej_spread(+30s)={hb_rej_spread} "
+                f"| rej_not_ready(+30s)={hb_rej_not_ready} | ts_fallbacks_total={state.spot_ts_fallback_count} "
+                f"| last_spot={secs_since_last_spot if secs_since_last_spot is not None else 'NA'}s "
+                f"| last_valid={secs_since_last_valid if secs_since_last_valid is not None else 'NA'}s"
+            )
+
+            log.info(
+                f"[{now}] BARRA | start={fmt_dt_utc(state.current_bar_start)} | age={bar_age_txt} "
+                f"| prox_cierre={prox_bar_txt} | {bar_txt}"
+            )
+
+            if state.is_warmed_up():
+                ind = compute_indicators()
+                side_txt = "UP" if ind["ltf_side"] == 1 else "DOWN"
+                wr = state.trades_win / max(state.trades_total, 1) * 100
+                log.info(
+                    f"[{now}] SISTEMA | READY | bars={state.n_bars} | trades={state.n_open_trades} "
+                    f"| pnl={state.pnl_bp_total:+.1f}bp | margin={state.total_margin_used:.0f}/{state.equity*MAX_MARGIN_PCT:.0f}€ "
+                    f"| ATR={ind['atr_bp']:.1f}bp | ADX={ind['adx']:.1f} | swing={ind['swing_range_bp']:.1f}bp "
+                    f"| side={side_txt} | WR={wr:.0f}%"
+                )
+            else:
+                faltan = needed - state.n_bars
+                log.info(
+                    f"[{now}] SISTEMA | CALENTANDO {state.n_bars}/{needed} | faltan={faltan} barras "
+                    f"| trades={state.n_open_trades} | pnl={state.pnl_bp_total:+.1f}bp"
+                )
+
+            if flags:
+                log.warning(f"[{now}] AVISO_FEED | {' | '.join(flags)}")
+
             reactor.callLater(HEARTBEAT_SECS, heartbeat)
 
         reactor.callLater(HEARTBEAT_SECS, heartbeat)
         log.info(f"Heartbeat activo (cada {HEARTBEAT_SECS}s)")
 
-    # ------------------------------------------------------------------
-    # PRECARGA HISTORICA — pide las ultimas N barras de H1
-    # ------------------------------------------------------------------
     def _load_historical_bars(self):
         try:
             req = ProtoOAGetTrendbarsReq()
@@ -694,25 +1075,25 @@ class BosBot:
             req.toTimestamp = now_ms
 
             self.client.send(req).addErrback(self._on_error)
+
             log.info(
-                f"Solicitando historico H1 | from={from_ms} to={now_ms} "
-                f"| lookback={HISTORICAL_LOOKBACK_DAYS} dias | count={HISTORICAL_BARS}"
+                f"Solicitando historico H1 | symbolId={state.symbol_id} | "
+                f"from={from_ms} to={now_ms} | lookback={HISTORICAL_LOOKBACK_DAYS} dias | count={HISTORICAL_BARS}"
             )
         except Exception as e:
-            log.warning(f"Precarga no disponible: {e}. "
-                        f"El bot calentara con datos en vivo (~{state.n_bars_needed()}h).")
+            log.warning(f"Precarga no disponible: {e}. El bot calentara con datos en vivo (~{state.n_bars_needed()}h).")
 
     def _on_historical_bars(self, message):
         try:
-            res=Protobuf.extract(message)
-            bars_data=list(res.trendbar)
+            res = Protobuf.extract(message)
+            bars_data = list(res.trendbar)
             if not bars_data:
                 log.warning("El servidor no devolvio barras historicas.")
                 return
 
-            loaded=[]
+            loaded = []
             for tb in bars_data:
-                d=100_000
+                d = 100_000
 
                 low_abs = getattr(tb, "low", None)
                 delta_open = getattr(tb, "deltaOpen", 0) or 0
@@ -736,7 +1117,7 @@ class BosBot:
                     continue
 
                 high = max(high, open_, close, low)
-                low = min(low, open_, close, high)
+                low  = min(low, open_, close, high)
 
                 loaded.append({
                     "time":  tb.utcTimestampInMinutes * 60,
@@ -749,128 +1130,224 @@ class BosBot:
                 })
 
             loaded.sort(key=lambda x: x["time"])
-            for bar in loaded:
-                state.add_bar(bar)
-            state.historical_loaded=True
 
-            fallback_close = loaded[-1]["close"]
+            dedup = []
+            seen = set()
+            for bar in loaded:
+                if bar["time"] not in seen:
+                    dedup.append(bar)
+                    seen.add(bar["time"])
+
+            for bar in dedup[-state.max_bars:]:
+                state.add_bar(bar)
+
+            state.historical_loaded = True
+
+            fallback_close = dedup[-1]["close"]
             self._seed_current_bar_after_historical(fallback_close)
             self.ready_for_ticks = True
 
-            needed=state.n_bars_needed()
-            log.info(f"Precarga completada: {len(loaded)} barras H1 cargadas.")
+            needed = state.n_bars_needed()
+            log.info(f"Precarga completada: {len(dedup)} barras H1 cargadas.")
+
+            if len(dedup) >= 2:
+                log.info(f"Rango historico cargado: {fmt_dt_utc(dedup[0]['time'])} -> {fmt_dt_utc(dedup[-1]['time'])}")
+
             if state.is_warmed_up():
-                log.info(f"INDICADORES LISTOS. El bot puede operar desde la proxima barra.")
-                ind=compute_indicators()
-                if not math.isnan(ind.get("atr_bp",float("nan"))):
-                    log.info(f"  Estado actual: ATR={ind['atr_bp']:.1f}bp | "
-                             f"ADX={ind['adx']:.1f} | "
-                             f"Lado={'UP' if ind['ltf_side']==1 else 'DOWN'}")
+                log.info("INDICADORES LISTOS. El bot puede operar desde la proxima barra.")
+                ind = compute_indicators()
+                if not math.isnan(ind.get("atr_bp", float("nan"))):
+                    log.info(
+                        f"  Estado actual: ATR={ind['atr_bp']:.1f}bp | ADX={ind['adx']:.1f} | "
+                        f"Lado={'UP' if ind['ltf_side']==1 else 'DOWN'} | Swing={ind['swing_range_bp']:.1f}bp"
+                    )
             else:
-                faltan=needed-state.n_bars
-                log.info(f"Calentamiento parcial: {state.n_bars}/{needed}. "
-                         f"Faltan {faltan} barras (~{faltan}h con datos en vivo).")
+                faltan = needed - state.n_bars
+                log.info(f"Calentamiento parcial: {state.n_bars}/{needed}. Faltan {faltan} barras (~{faltan}h con datos en vivo).")
+
         except Exception as e:
             log.error(f"Error procesando barras historicas: {e}", exc_info=True)
 
-    # ------------------------------------------------------------------
-    # SPOTS, ORDENES, RECONCILE
-    # ------------------------------------------------------------------
     def _reconcile(self):
-        req=ProtoOAReconcileReq()
-        req.ctidTraderAccountId=ACCOUNT_ID
+        req = ProtoOAReconcileReq()
+        req.ctidTraderAccountId = ACCOUNT_ID
         self.client.send(req).addErrback(self._on_error)
 
     def _subscribe_spots(self):
-        req=ProtoOASubscribeSpotsReq()
-        req.ctidTraderAccountId=ACCOUNT_ID
+        req = ProtoOASubscribeSpotsReq()
+        req.ctidTraderAccountId = ACCOUNT_ID
         req.symbolId.append(state.symbol_id)
         self.client.send(req).addErrback(self._on_error)
-        log.info(f"Suscrito a {SYMBOL_NAME} (symbolId={state.symbol_id})")
+        log.info(f"Suscrito a {SYMBOL_NAME} (symbolId={state.symbol_id}, resolved={state.symbol_resolved})")
 
     def _on_spot(self, message):
-        spot=Protobuf.extract(message)
-        if spot.symbolId!=state.symbol_id:
+        spot = Protobuf.extract(message)
+        if spot.symbolId != state.symbol_id:
             return
 
-        d=100_000
-        bid=spot.bid/d
-        ask=spot.ask/d
-        if bid<=0 or ask<=0:
+        d = 100_000
+        bid = spot.bid / d
+        ask = spot.ask / d
+
+        if bid <= 0 or ask <= 0:
             return
 
-        ts=int(spot.timestamp/1000)
+        raw_ts_ms = getattr(spot, "timestamp", None)
+        ts = normalize_spot_timestamp(raw_ts_ms)
+
+        spread_bp = px_to_bp(ask - bid, bid)
+        mid = (bid + ask) / 2.0
+
+        state.raw_spot_count += 1
+        state.last_spot_ts = ts
+        state.last_bid = bid
+        state.last_ask = ask
+        state.last_mid = mid
+        state.last_spread_bp = spread_bp
 
         self.last_bid = bid
         self.last_ask = ask
         self.last_ts = ts
 
-        if (ask-bid)/bid*10_000>MAX_SPREAD_BP:
+        if spread_bp > MAX_SPREAD_BP:
+            state.spot_reject_spread += 1
             return
 
         if not self.ready_for_ticks:
+            state.spot_reject_not_ready += 1
             return
 
-        on_tick(bid,ask,ts,self)
+        on_tick(bid, ask, ts, self)
 
     def _on_execution(self, message):
-        ev=Protobuf.extract(message)
-        pos=ev.position if hasattr(ev,"position") else None
-        if not pos: return
-        pos_id=pos.positionId
+        ev = Protobuf.extract(message)
+        pos = ev.position if hasattr(ev, "position") else None
+        if not pos:
+            return
 
-        if pos.positionStatus==1 and state._pending:  # ABIERTO
-            p=state._pending
-            trade=OpenTrade(
-                position_id=pos_id, side=p["side"],
-                entry_price=p["entry_price"], sl_price=p["sl_price"],
-                tp_price=p["tp_price"], sl_bp=p["sl_bp"], tp_bp=p["tp_bp"],
-                units=p["units"], entry_bar_idx=p["entry_bar_idx"],
-                margin_used=p["margin"])
-            state.open_trades[pos_id]=trade
-            state._pending=None
-            state.trades_total+=1
-            log.info(f"  TRADE ABIERTO ID={pos_id} {trade.side.upper()} "
-                     f"{trade.units:,}u | Activos: {state.n_open_trades}")
+        pos_id = pos.positionId
+        pos_status = getattr(pos, "positionStatus", None)
+        actual_price = safe_float(getattr(pos, "price", None), default=float("nan"))
 
-        elif pos.positionStatus==2 and pos_id in state.open_trades:  # CERRADO
-            trade=state.open_trades.pop(pos_id)
-            cp=getattr(pos,"price",trade.entry_price)
-            pnl_bp=((trade.entry_price-cp) if trade.side=="sell"
-                    else (cp-trade.entry_price))/trade.entry_price*10_000
-            state.pnl_bp_total+=pnl_bp
-            if pnl_bp>0: state.trades_win+=1
-            else:        state.trades_loss+=1
-            wr=state.trades_win/max(state.trades_total,1)*100
-            log.info(f"  TRADE CERRADO ID={pos_id} {trade.side.upper()} | "
-                     f"P&L={pnl_bp:+.1f}bp | WR={wr:.0f}% | "
-                     f"Total={state.pnl_bp_total:+.1f}bp | Activos: {state.n_open_trades}")
+        if pos_status == 1 and state._pending:
+            p = state._pending
+
+            fill_price = p["entry_price_ref"]
+            if not math.isnan(actual_price) and actual_price > 0:
+                fill_price = actual_price
+
+            sl_bp = p["sl_bp"]
+            tp_bp = p["tp_bp"]
+            sl_d = bp_to_price(sl_bp, fill_price)
+            tp_d = bp_to_price(tp_bp, fill_price)
+
+            if p["side"] == "sell":
+                sl_price = fill_price + sl_d
+                tp_price = fill_price - tp_d
+            else:
+                sl_price = fill_price - sl_d
+                tp_price = fill_price + tp_d
+
+            trade = OpenTrade(
+                position_id=pos_id,
+                side=p["side"],
+                entry_price=fill_price,
+                sl_price=sl_price,
+                tp_price=tp_price,
+                sl_bp=sl_bp,
+                tp_bp=tp_bp,
+                units=p["units"],
+                entry_bar_idx=p["entry_bar_idx"],
+                margin_used=p["margin"],
+            )
+
+            state.open_trades[pos_id] = trade
+            state._pending = None
+            state.trades_total += 1
+
+            log.info(
+                f"  TRADE ABIERTO ID={pos_id} {trade.side.upper()} {trade.units:,}u | "
+                f"fill={trade.entry_price:.5f} | SL={trade.sl_price:.5f} ({trade.sl_bp:.1f}bp) | "
+                f"TP={trade.tp_price:.5f} ({trade.tp_bp:.1f}bp) | Activos: {state.n_open_trades}"
+            )
+
+            self.amend_position_sltp(pos_id, trade.sl_price, trade.tp_price)
+            trade.sltp_sent = True
+            return
+
+        if pos_status == 2 and pos_id in state.open_trades:
+            trade = state.open_trades.pop(pos_id)
+
+            cp = trade.entry_price
+            if not math.isnan(actual_price) and actual_price > 0:
+                cp = actual_price
+
+            pnl_bp = (
+                ((trade.entry_price - cp) if trade.side == "sell" else (cp - trade.entry_price))
+                / trade.entry_price
+            ) * 10_000.0
+
+            state.pnl_bp_total += pnl_bp
+            if pnl_bp > 0:
+                state.trades_win += 1
+            else:
+                state.trades_loss += 1
+
+            wr = state.trades_win / max(state.trades_total, 1) * 100
+            log.info(
+                f"  TRADE CERRADO ID={pos_id} {trade.side.upper()} | close={cp:.5f} | "
+                f"P&L={pnl_bp:+.1f}bp | WR={wr:.0f}% | Total={state.pnl_bp_total:+.1f}bp | "
+                f"Activos: {state.n_open_trades}"
+            )
 
     def _on_reconcile(self, message):
-        rec=Protobuf.extract(message)
-        n=len(rec.position) if rec.position else 0
+        rec = Protobuf.extract(message)
+        n = len(rec.position) if rec.position else 0
         log.info(f"Reconcile: {n} posiciones abiertas al conectar.")
 
-    def send_order(self, side, units, sl_price, tp_price):
-        req=ProtoOANewOrderReq()
-        req.ctidTraderAccountId=ACCOUNT_ID
-        req.symbolId=state.symbol_id
-        req.orderType=ProtoOAOrderType.MARKET
-        req.tradeSide=ProtoOATradeSide.BUY if side=="buy" else ProtoOATradeSide.SELL
-        req.volume=units*100
-        d=100_000
-        req.stopLoss=int(sl_price*d)
-        req.takeProfit=int(tp_price*d)
+    def send_order(self, side, units):
+        req = ProtoOANewOrderReq()
+        req.ctidTraderAccountId = ACCOUNT_ID
+        req.symbolId = state.symbol_id
+        req.orderType = ProtoOAOrderType.MARKET
+        req.tradeSide = ProtoOATradeSide.BUY if side == "buy" else ProtoOATradeSide.SELL
+        req.volume = units * 100
+        req.comment = "BOS_v5"
+        req.label = f"BOSv5_{SYMBOL_NAME}_{side}"
+
         self.client.send(req).addErrback(self._on_error)
 
-    def close_position(self, position_id):
-        if position_id not in state.open_trades: return
-        trade=state.open_trades[position_id]
-        req=ProtoOAClosePositionReq()
-        req.ctidTraderAccountId=ACCOUNT_ID
-        req.positionId=position_id
-        req.volume=trade.units*100
+        log.info(
+            f"  MARKET ORDER ENVIADA | side={side.upper()} | units={units:,} | "
+            f"volume_proto={req.volume} | symbolId={state.symbol_id}"
+        )
+
+    def amend_position_sltp(self, position_id, sl_price, tp_price):
+        req = ProtoOAAmendPositionSLTPReq()
+        req.ctidTraderAccountId = ACCOUNT_ID
+        req.positionId = position_id
+        req.stopLoss = sl_price
+        req.takeProfit = tp_price
         self.client.send(req).addErrback(self._on_error)
+
+        log.info(
+            f"  AMEND SLTP ENVIADO | positionId={position_id} | SL={sl_price:.5f} | TP={tp_price:.5f}"
+        )
+
+    def close_position(self, position_id):
+        if position_id not in state.open_trades:
+            return
+
+        trade = state.open_trades[position_id]
+        req = ProtoOAClosePositionReq()
+        req.ctidTraderAccountId = ACCOUNT_ID
+        req.positionId = position_id
+        req.volume = trade.units * 100
+        self.client.send(req).addErrback(self._on_error)
+
+        log.info(
+            f"  CIERRE ENVIADO | positionId={position_id} | side={trade.side.upper()} | units={trade.units:,}"
+        )
 
     def start(self):
         self._connect()
@@ -882,17 +1359,20 @@ class BosBot:
 # =============================================================================
 
 def main():
-    log.info("="*65)
-    log.info("EURUSD BOS REVERSAL BOT v3")
-    log.info("="*65)
+    log.info("=" * 78)
+    log.info("EURUSD BOS REVERSAL BOT v5")
+    log.info("=" * 78)
     log.info(f"  Cuenta: {ACCOUNT_ID} ({'DEMO' if USE_DEMO else 'LIVE'})")
+    log.info(f"  Symbol: {SYMBOL_NAME} | symbolId fallback={DEFAULT_SYMBOL_ID}")
     log.info(f"  Filtros: ATR>={ATR_MIN_BP}bp + ADX>={ADX_MIN_VAL}")
+    log.info(f"  Swing lookback: {SWING_LOOKBACK} barras | swing min={MIN_SWING_BP}bp")
     log.info(f"  SL: ATR*{ATR_MULT} clip[{SL_MIN_BP}-{SL_MAX_BP}bp] | TP: {TP_RATIO}:1")
     log.info(f"  Riesgo: {RISK_PCT*100:.1f}% | MarginCap: {MAX_MARGIN_PCT*100:.0f}%")
+    log.info(f"  Spread max: {MAX_SPREAD_BP:.1f}bp")
     log.info(f"  Heartbeat: cada {HEARTBEAT_SECS}s")
     log.info(f"  Precarga historica: hasta {HISTORICAL_BARS} barras H1 | lookback {HISTORICAL_LOOKBACK_DAYS} dias")
-    log.info("="*65)
+    log.info("=" * 78)
     BosBot().start()
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
