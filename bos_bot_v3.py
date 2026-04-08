@@ -1,7 +1,11 @@
 """
-IC Markets — EURUSD BOS Reversal Bot
+IC Markets — EURUSD BOS Reversal Bot v6
+Cambios clave respecto a v5:
+  - FIX del amend SL/TP: enviar stopLoss / takeProfit en formato entero cTrader
+  - Log detallado de ProtoOAOrderErrorEvent
+  - No marcar sltp_sent=True de forma optimista tras enviar amend
+  - Se preserva el resto del codigo y de la estrategia SIN CAMBIAR
 """
-
 
 import logging
 import math
@@ -79,10 +83,10 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("bos_bot_v5.log", encoding="utf-8"),
+        logging.FileHandler("bos_bot_v6.log", encoding="utf-8"),
     ]
 )
-log = logging.getLogger("BOS_v5")
+log = logging.getLogger("BOS_v6")
 
 # =============================================================================
 # DATACLASSES
@@ -625,7 +629,7 @@ class BosBot:
         self.last_ask = None
         self.last_ts = None
 
-        log.info(f"Bot v5 inicializado | Servidor: {host}")
+        log.info(f"Bot v6 inicializado | Servidor: {host}")
 
     def _connect(self):
         self.client.startService()
@@ -892,6 +896,17 @@ class BosBot:
                 f"payloadType={t} | "
                 f"errorCode={getattr(obj, 'errorCode', None)} | "
                 f"description={getattr(obj, 'description', None)} | "
+                f"accountId={getattr(obj, 'ctidTraderAccountId', None)}"
+            )
+            return
+
+        if t == 2132 or obj_name == "ProtoOAOrderErrorEvent":
+            log.error(
+                "OrderErrorEvent | "
+                f"errorCode={getattr(obj, 'errorCode', None)} | "
+                f"description={getattr(obj, 'description', None)} | "
+                f"orderId={getattr(obj, 'orderId', None)} | "
+                f"positionId={getattr(obj, 'positionId', None)} | "
                 f"accountId={getattr(obj, 'ctidTraderAccountId', None)}"
             )
             return
@@ -1272,7 +1287,7 @@ class BosBot:
             )
 
             self.amend_position_sltp(pos_id, trade.sl_price, trade.tp_price)
-            trade.sltp_sent = True
+            trade.sltp_sent = False
             return
 
         if pos_status == 2 and pos_id in state.open_trades:
@@ -1312,8 +1327,8 @@ class BosBot:
         req.orderType = ProtoOAOrderType.MARKET
         req.tradeSide = ProtoOATradeSide.BUY if side == "buy" else ProtoOATradeSide.SELL
         req.volume = units * 100
-        req.comment = "BOS_v5"
-        req.label = f"BOSv5_{SYMBOL_NAME}_{side}"
+        req.comment = "BOS_v6"
+        req.label = f"BOSv6_{SYMBOL_NAME}_{side}"
 
         self.client.send(req).addErrback(self._on_error)
 
@@ -1326,12 +1341,17 @@ class BosBot:
         req = ProtoOAAmendPositionSLTPReq()
         req.ctidTraderAccountId = ACCOUNT_ID
         req.positionId = position_id
-        req.stopLoss = sl_price
-        req.takeProfit = tp_price
+
+        d = 100_000
+        req.stopLoss = int(round(sl_price * d))
+        req.takeProfit = int(round(tp_price * d))
+
         self.client.send(req).addErrback(self._on_error)
 
         log.info(
-            f"  AMEND SLTP ENVIADO | positionId={position_id} | SL={sl_price:.5f} | TP={tp_price:.5f}"
+            f"  AMEND SLTP ENVIADO | positionId={position_id} | "
+            f"SL={sl_price:.5f} ({int(round(sl_price * d))}) | "
+            f"TP={tp_price:.5f} ({int(round(tp_price * d))})"
         )
 
     def close_position(self, position_id):
@@ -1360,7 +1380,7 @@ class BosBot:
 
 def main():
     log.info("=" * 78)
-    log.info("EURUSD BOS REVERSAL BOT v5")
+    log.info("EURUSD BOS REVERSAL BOT v6")
     log.info("=" * 78)
     log.info(f"  Cuenta: {ACCOUNT_ID} ({'DEMO' if USE_DEMO else 'LIVE'})")
     log.info(f"  Symbol: {SYMBOL_NAME} | symbolId fallback={DEFAULT_SYMBOL_ID}")
