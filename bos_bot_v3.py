@@ -976,7 +976,7 @@ class BosBot:
             else:
                 log.warning("No se pudieron extraer cuentas del token desde la respuesta. Intentando autenticar la cuenta configurada igualmente.")
 
-            self._authenticate_account()
+            reactor.callLater(0.5, self._authenticate_account)
             return
 
         if t == 2103 or obj_name == "ProtoOAAccountAuthRes":
