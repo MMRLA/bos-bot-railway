@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Trading Bot Dashboard</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <style>
+    body { font-family: Arial; padding: 20px; background: #0f172a; color: white; }
+    .card { background: #1e293b; padding: 15px; margin: 10px 0; border-radius: 10px; }
+  </style>
+</head>
+<body>
+
+<h1>📈 BOS Bot Dashboard</h1>
+
+<div class="card" id="info"></div>
+<div class="card" id="trades"></div>
+
+<script>
+async function load() {
+    const res = await fetch('/state');
+    const data = await res.json();
+
+    document.getElementById('info').innerHTML = `
+        <h2>Estado</h2>
+        PnL: ${data.pnl_bp} bp<br>
+        Trades: ${data.trades_total}<br>
+        Precio: ${data.last_price}<br>
+        Spread: ${data.spread} bp
+    `;
+
+    document.getElementById('trades').innerHTML = `
+        <h2>Open Trades</h2>
+        ${data.open_trades.map(t => `
+            ID: ${t.id} | ${t.side} | entry: ${t.entry}
+        `).join('<br>')}
+    `;
+}
+
+setInterval(load, 2000);
+load();
+</script>
+
+</body>
+</html>
