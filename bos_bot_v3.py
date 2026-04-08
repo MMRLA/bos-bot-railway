@@ -97,15 +97,56 @@ import json
 import os
 
 STATE_FILE = "/opt/bos-bot/data/state.json"
+HISTORY_FILE = "/opt/bos-bot/data/history.jsonl"
 
 def save_state():
     try:
+        ind = compute_indicators() if state.is_warmed_up() else {}
+
+        now_ts = now_utc_ts()
+        secs_since_last_spot = None if state.last_spot_ts is None else now_ts - state.last_spot_ts
+        secs_since_last_valid = None if state.last_valid_tick_ts is None else now_ts - state.last_valid_tick_ts
+
+        side_txt = None
+        if ind:
+            if ind.get("ltf_side") == 1:
+                side_txt = "UP"
+            elif ind.get("ltf_side") == -1:
+                side_txt = "DOWN"
+
         data = {
+            "bot_status": "running",
+            "account_id": ACCOUNT_ID,
+            "use_demo": USE_DEMO,
+            "symbol": SYMBOL_NAME,
             "equity": state.equity,
             "pnl_bp": state.pnl_bp_total,
             "trades_total": state.trades_total,
             "trades_win": state.trades_win,
             "trades_loss": state.trades_loss,
+            "win_rate": (state.trades_win / max(state.trades_total, 1)) * 100.0,
+            "open_trades_count": state.n_open_trades,
+            "margin_used": state.total_margin_used,
+            "margin_cap": state.equity * MAX_MARGIN_PCT,
+            "bars": state.n_bars,
+            "historical_loaded": state.historical_loaded,
+            "current_bar_start": state.current_bar_start,
+            "current_bar_valid_ticks": state.current_bar_valid_ticks,
+            "last_price": state.last_mid,
+            "bid": state.last_bid,
+            "ask": state.last_ask,
+            "spread": state.last_spread_bp,
+            "last_spot_ts": state.last_spot_ts,
+            "last_valid_tick_ts": state.last_valid_tick_ts,
+            "last_spot_age_sec": secs_since_last_spot,
+            "last_valid_tick_age_sec": secs_since_last_valid,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "indicators": {
+                "atr_bp": ind.get("atr_bp") if ind else None,
+                "adx": ind.get("adx") if ind else None,
+                "swing_range_bp": ind.get("swing_range_bp") if ind else None,
+                "side": side_txt,
+            },
             "open_trades": [
                 {
                     "id": t.position_id,
@@ -113,20 +154,46 @@ def save_state():
                     "entry": t.entry_price,
                     "sl": t.sl_price,
                     "tp": t.tp_price,
-                    "units": t.units
+                    "units": t.units,
+                    "entry_time": t.entry_time.isoformat() if t.entry_time else None,
+                    "entry_bar_idx": t.entry_bar_idx,
+                    "margin_used": t.margin_used,
                 }
                 for t in state.open_trades.values()
             ],
-            "last_price": state.last_mid,
-            "spread": state.last_spread_bp,
-            "timestamp": datetime.now(timezone.utc).isoformat()
         }
 
-        with open(STATE_FILE, "w") as f:
+        with open(STATE_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
     except Exception as e:
         log.warning(f"Error guardando state: {e}")
+
+
+def append_history():
+    try:
+        ind = compute_indicators() if state.is_warmed_up() else {}
+
+        row = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "pnl_bp": state.pnl_bp_total,
+            "last_price": state.last_mid,
+            "spread": state.last_spread_bp,
+            "trades_total": state.trades_total,
+            "open_trades": state.n_open_trades,
+            "margin_used": state.total_margin_used,
+            "atr_bp": ind.get("atr_bp") if ind else None,
+            "adx": ind.get("adx") if ind else None,
+            "swing_range_bp": ind.get("swing_range_bp") if ind else None,
+            "side": ind.get("ltf_side") if ind else None,
+        }
+
+        with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+
+    except Exception as e:
+        log.warning(f"Error guardando history: {e}")
+
 
 # =============================================================================
 # DATACLASSES
@@ -1160,7 +1227,8 @@ class BosBot:
 
             # guardar estado para dashboard
             save_state()
-            
+            append_history()
+
             reactor.callLater(HEARTBEAT_SECS, heartbeat)
 
         reactor.callLater(HEARTBEAT_SECS, heartbeat)
