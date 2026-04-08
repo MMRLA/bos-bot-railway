@@ -1,6 +1,13 @@
 """
 IC Markets — EURUSD BOS Reversal Bot v6
-
+Cambios clave respecto a v5:
+  - FIX del amend SL/TP: enviar stopLoss / takeProfit en formato entero cTrader
+  - Log detallado de ProtoOAOrderErrorEvent
+  - No marcar sltp_sent=True de forma optimista tras enviar amend
+  - FIX timeout auth cuenta: guardar/cancelar callLater correctamente
+  - FIX reconnect: evitar reconnect timers duplicados
+  - FIX logging Twisted: timeouts no fatales no ensucian como error crítico
+  - Se preserva el resto del codigo y de la estrategia SIN CAMBIAR
 """
 
 import logging
@@ -617,6 +624,7 @@ class BosBot:
         self.client.setMessageReceivedCallback(self._on_message)
 
         self.account_auth_ok = False
+        self.app_auth_ok = False
         self.heartbeat_started = False
         self.hourly_timer_started = False
         self.ready_for_ticks = False
@@ -625,10 +633,24 @@ class BosBot:
         self.last_ask = None
         self.last_ts = None
 
+        self.account_auth_timeout_call = None
+        self.reconnect_call = None
+        self.shutting_down = False
+
         log.info(f"Bot v6 inicializado | Servidor: {host}")
 
     def _connect(self):
         self.client.startService()
+
+    def _cancel_account_auth_timeout(self):
+        if self.account_auth_timeout_call is not None and self.account_auth_timeout_call.active():
+            self.account_auth_timeout_call.cancel()
+        self.account_auth_timeout_call = None
+
+    def _cancel_reconnect_call(self):
+        if self.reconnect_call is not None and self.reconnect_call.active():
+            self.reconnect_call.cancel()
+        self.reconnect_call = None
 
     def _reset_market_state(self):
         state.bars = []
@@ -745,6 +767,12 @@ class BosBot:
 
     def _on_connected(self, client):
         log.info("Conectado. Autenticando aplicacion...")
+
+        self.app_auth_ok = False
+        self.account_auth_ok = False
+        self._cancel_reconnect_call()
+        self._cancel_account_auth_timeout()
+
         req = ProtoOAApplicationAuthReq()
         req.clientId = CLIENT_ID
         req.clientSecret = CLIENT_SECRET
@@ -752,11 +780,29 @@ class BosBot:
 
     def _on_disconnected(self, client, reason):
         self.ready_for_ticks = False
+        self.app_auth_ok = False
+        self.account_auth_ok = False
+        self._cancel_account_auth_timeout()
+
         log.warning(f"Desconectado: {reason}. Reconectando en 15s...")
-        reactor.callLater(15, self._connect)
+
+        if not self.shutting_down:
+            if self.reconnect_call is None or not self.reconnect_call.active():
+                self.reconnect_call = reactor.callLater(15, self._connect)
 
     def _on_error(self, failure):
-        log.error(f"Error: {failure}")
+        try:
+            failure_type = failure.type.__name__ if getattr(failure, "type", None) else str(type(failure))
+            failure_msg = failure.getErrorMessage() if hasattr(failure, "getErrorMessage") else str(failure)
+        except Exception:
+            failure_type = "Unknown"
+            failure_msg = str(failure)
+
+        if "TimeoutError" in failure_type or "TimeoutError" in failure_msg:
+            log.warning(f"Twisted timeout no fatal: {failure_msg}")
+            return
+
+        log.error(f"Error Twisted: {failure}")
 
     def _safe_extract(self, message):
         try:
@@ -815,13 +861,20 @@ class BosBot:
     def _authenticate_account(self):
         log.info(f"Autenticando cuenta {ACCOUNT_ID}...")
         self.account_auth_ok = False
+        self._cancel_account_auth_timeout()
+
         req = ProtoOAAccountAuthReq()
         req.ctidTraderAccountId = ACCOUNT_ID
         req.accessToken = ACCESS_TOKEN
         self.client.send(req).addErrback(self._on_error)
-        reactor.callLater(ACCOUNT_AUTH_TIMEOUT_SECS, self._check_account_auth_timeout)
+
+        self.account_auth_timeout_call = reactor.callLater(
+            ACCOUNT_AUTH_TIMEOUT_SECS,
+            self._check_account_auth_timeout
+        )
 
     def _check_account_auth_timeout(self):
+        self.account_auth_timeout_call = None
         if not self.account_auth_ok:
             log.error("Timeout esperando autenticacion de cuenta. Revisa ACCESS_TOKEN, ACCOUNT_ID y asociacion token-cuenta.")
 
@@ -908,6 +961,7 @@ class BosBot:
             return
 
         if t == 2101 or obj_name == "ProtoOAApplicationAuthRes":
+            self.app_auth_ok = True
             self._request_account_list()
             return
 
@@ -927,6 +981,7 @@ class BosBot:
 
         if t == 2103 or obj_name == "ProtoOAAccountAuthRes":
             self.account_auth_ok = True
+            self._cancel_account_auth_timeout()
             self._reset_market_state()
             log.info(f"Cuenta {ACCOUNT_ID} autenticada correctamente.")
 
