@@ -749,6 +749,7 @@ class BosBot:
         self.account_auth_timeout_call = None
         self.reconnect_call = None
         self.shutting_down = False
+        self.manual_disconnect_in_progress=False
 
         log.info(f"Bot v6 inicializado | Servidor: {host}")
 
@@ -897,7 +898,14 @@ class BosBot:
         self.account_auth_ok = False
         self._cancel_account_auth_timeout()
 
-        log.warning(f"Desconectado: {reason}. Reconectando en 15s...")
+        log.warning(f"Desconectado: {reason}.")
+
+        if self.manual_disconnect_in_progress:
+            log.warning("Desconexion provocada por reinicio controlado. No se agenda reconnect duplicado.")
+            self.manual_disconnect_in_progress = False
+            return
+
+        log.warning("Reconectando en 15s...")
 
         if not self.shutting_down:
             if self.reconnect_call is None or not self.reconnect_call.active():
@@ -1086,12 +1094,15 @@ class BosBot:
             self._cancel_account_auth_timeout()
             self._reset_market_state()
 
+            self._cancel_reconnect_call()
+            self.manual_disconnect_in_progress = True
+
             try:
                 self.client.stopService()
             except Exception as e:
                 log.warning(f"No se pudo parar client tras AccountDisconnectEvent: {e}")
+                self.manual_disconnect_in_progress = False
 
-            self._cancel_reconnect_call()
             log.warning("Reiniciando conexion completa en 5s tras AccountDisconnectEvent...")
             self.reconnect_call = reactor.callLater(5, self._connect)
             return
