@@ -1,10 +1,6 @@
 """
 IC Markets — EURUSD BOS Reversal Bot v6
-Cambios clave respecto a v5:
-  - FIX del amend SL/TP: enviar stopLoss / takeProfit en formato entero cTrader
-  - Log detallado de ProtoOAOrderErrorEvent
-  - No marcar sltp_sent=True de forma optimista tras enviar amend
-  - Se preserva el resto del codigo y de la estrategia SIN CAMBIAR
+
 """
 
 import logging
