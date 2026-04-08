@@ -91,6 +91,43 @@ logging.basicConfig(
 )
 log = logging.getLogger("BOS_v6")
 
+
+
+import json
+import os
+
+STATE_FILE = "/opt/bos-bot/data/state.json"
+
+def save_state():
+    try:
+        data = {
+            "equity": state.equity,
+            "pnl_bp": state.pnl_bp_total,
+            "trades_total": state.trades_total,
+            "trades_win": state.trades_win,
+            "trades_loss": state.trades_loss,
+            "open_trades": [
+                {
+                    "id": t.position_id,
+                    "side": t.side,
+                    "entry": t.entry_price,
+                    "sl": t.sl_price,
+                    "tp": t.tp_price,
+                    "units": t.units
+                }
+                for t in state.open_trades.values()
+            ],
+            "last_price": state.last_mid,
+            "spread": state.last_spread_bp,
+            "timestamp": datetime.now(timezone.utc).isoformat()
+        }
+
+        with open(STATE_FILE, "w") as f:
+            json.dump(data, f, indent=2)
+
+    except Exception as e:
+        log.warning(f"Error guardando state: {e}")
+
 # =============================================================================
 # DATACLASSES
 # =============================================================================
@@ -1121,6 +1158,9 @@ class BosBot:
             if flags:
                 log.warning(f"[{now}] AVISO_FEED | {' | '.join(flags)}")
 
+            # guardar estado para dashboard
+            save_state()
+            
             reactor.callLater(HEARTBEAT_SECS, heartbeat)
 
         reactor.callLater(HEARTBEAT_SECS, heartbeat)
