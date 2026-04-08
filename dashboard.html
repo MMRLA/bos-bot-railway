@@ -1,44 +1,276 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <title>Trading Bot Dashboard</title>
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BOS Bot Dashboard</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
   <style>
-    body { font-family: Arial; padding: 20px; background: #0f172a; color: white; }
-    .card { background: #1e293b; padding: 15px; margin: 10px 0; border-radius: 10px; }
+    body {
+      font-family: Arial, sans-serif;
+      margin: 0;
+      background: #06153a;
+      color: #ffffff;
+    }
+    .container {
+      padding: 24px;
+    }
+    h1 {
+      margin-top: 0;
+      font-size: 28px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 16px;
+      margin-bottom: 20px;
+    }
+    .card {
+      background: #1f2f4a;
+      border-radius: 12px;
+      padding: 18px;
+      box-sizing: border-box;
+    }
+    .card h2 {
+      margin-top: 0;
+      font-size: 18px;
+    }
+    .label {
+      opacity: 0.8;
+    }
+    .big {
+      font-size: 24px;
+      font-weight: bold;
+    }
+    .section {
+      margin-bottom: 20px;
+    }
+    .logs {
+      background: #0b1220;
+      color: #d7e3ff;
+      padding: 12px;
+      border-radius: 12px;
+      height: 320px;
+      overflow-y: auto;
+      white-space: pre-wrap;
+      font-family: Consolas, monospace;
+      font-size: 12px;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      color: white;
+    }
+    th, td {
+      text-align: left;
+      padding: 8px;
+      border-bottom: 1px solid #2c3b57;
+      font-size: 14px;
+    }
+    canvas {
+      background: white;
+      border-radius: 8px;
+      padding: 8px;
+    }
   </style>
 </head>
 <body>
+  <div class="container">
+    <h1>📈 BOS Bot Dashboard</h1>
 
-<h1>📈 BOS Bot Dashboard</h1>
-
-<div class="card" id="info"></div>
-<div class="card" id="trades"></div>
-
-<script>
-async function load() {
-    const res = await fetch('/state');
-    const data = await res.json();
-
-    document.getElementById('info').innerHTML = `
+    <div class="grid">
+      <div class="card">
         <h2>Estado</h2>
-        PnL: ${data.pnl_bp} bp<br>
-        Trades: ${data.trades_total}<br>
-        Precio: ${data.last_price}<br>
-        Spread: ${data.spread} bp
-    `;
+        <div id="statusBlock">Loading...</div>
+      </div>
 
-    document.getElementById('trades').innerHTML = `
-        <h2>Open Trades</h2>
-        ${data.open_trades.map(t => `
-            ID: ${t.id} | ${t.side} | entry: ${t.entry}
-        `).join('<br>')}
-    `;
-}
+      <div class="card">
+        <h2>Mercado</h2>
+        <div id="marketBlock">Loading...</div>
+      </div>
 
-setInterval(load, 2000);
-load();
-</script>
+      <div class="card">
+        <h2>Sistema</h2>
+        <div id="systemBlock">Loading...</div>
+      </div>
 
+      <div class="card">
+        <h2>Margen</h2>
+        <div id="marginBlock">Loading...</div>
+      </div>
+    </div>
+
+    <div class="section card">
+      <h2>Open Trades</h2>
+      <div id="tradesBlock">No open trades</div>
+    </div>
+
+    <div class="section grid">
+      <div class="card">
+        <h2>PnL acumulado</h2>
+        <canvas id="pnlChart"></canvas>
+      </div>
+      <div class="card">
+        <h2>Precio</h2>
+        <canvas id="priceChart"></canvas>
+      </div>
+      <div class="card">
+        <h2>Spread</h2>
+        <canvas id="spreadChart"></canvas>
+      </div>
+    </div>
+
+    <div class="section card">
+      <h2>Logs recientes</h2>
+      <div id="logsBlock" class="logs">Loading logs...</div>
+    </div>
+  </div>
+
+  <script>
+    let pnlChart, priceChart, spreadChart;
+
+    function fmt(x, digits = 2) {
+      if (x === null || x === undefined || Number.isNaN(x)) return "NA";
+      return Number(x).toFixed(digits);
+    }
+
+    function createChart(ctx, label) {
+      return new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: [],
+          datasets: [{
+            label: label,
+            data: [],
+            borderWidth: 2,
+            fill: false,
+            tension: 0.2
+          }]
+        },
+        options: {
+          responsive: true,
+          animation: false,
+          scales: {
+            x: { display: true },
+            y: { display: true }
+          }
+        }
+      });
+    }
+
+    async function loadState() {
+      const res = await fetch('/state');
+      const data = await res.json();
+
+      const statusHtml = `
+        <div><span class="label">Bot:</span> ${data.bot_status ?? "running"}</div>
+        <div><span class="label">Cuenta:</span> ${data.account_id} (${data.use_demo ? "DEMO" : "LIVE"})</div>
+        <div><span class="label">Símbolo:</span> ${data.symbol}</div>
+        <div><span class="label">Última actualización:</span> ${data.timestamp ?? "NA"}</div>
+        <div class="big">PnL: ${fmt(data.pnl_bp, 1)} bp</div>
+        <div><span class="label">Trades:</span> ${data.trades_total}</div>
+        <div><span class="label">Win rate:</span> ${fmt(data.win_rate, 0)}%</div>
+      `;
+      document.getElementById('statusBlock').innerHTML = statusHtml;
+
+      const marketHtml = `
+        <div><span class="label">Bid:</span> ${fmt(data.bid, 5)}</div>
+        <div><span class="label">Ask:</span> ${fmt(data.ask, 5)}</div>
+        <div><span class="label">Mid:</span> ${fmt(data.last_price, 5)}</div>
+        <div><span class="label">Spread:</span> ${fmt(data.spread, 3)} bp</div>
+        <div><span class="label">Último spot:</span> ${data.last_spot_age_sec ?? "NA"} s</div>
+        <div><span class="label">Último tick válido:</span> ${data.last_valid_tick_age_sec ?? "NA"} s</div>
+      `;
+      document.getElementById('marketBlock').innerHTML = marketHtml;
+
+      const systemHtml = `
+        <div><span class="label">Barras:</span> ${data.bars ?? "NA"}</div>
+        <div><span class="label">Histórico cargado:</span> ${data.historical_loaded ? "Sí" : "No"}</div>
+        <div><span class="label">Ticks barra actual:</span> ${data.current_bar_valid_ticks ?? "NA"}</div>
+        <div><span class="label">ATR:</span> ${fmt(data.indicators?.atr_bp, 1)} bp</div>
+        <div><span class="label">ADX:</span> ${fmt(data.indicators?.adx, 1)}</div>
+        <div><span class="label">Swing:</span> ${fmt(data.indicators?.swing_range_bp, 1)} bp</div>
+        <div><span class="label">Lado:</span> ${data.indicators?.side ?? "NA"}</div>
+      `;
+      document.getElementById('systemBlock').innerHTML = systemHtml;
+
+      const marginHtml = `
+        <div><span class="label">Open trades:</span> ${data.open_trades_count}</div>
+        <div><span class="label">Margin used:</span> ${fmt(data.margin_used, 0)} €</div>
+        <div><span class="label">Margin cap:</span> ${fmt(data.margin_cap, 0)} €</div>
+      `;
+      document.getElementById('marginBlock').innerHTML = marginHtml;
+
+      if (data.open_trades && data.open_trades.length > 0) {
+        let html = `<table>
+          <thead>
+            <tr>
+              <th>ID</th><th>Side</th><th>Entry</th><th>SL</th><th>TP</th><th>Units</th><th>Margin</th>
+            </tr>
+          </thead><tbody>`;
+        for (const t of data.open_trades) {
+          html += `<tr>
+            <td>${t.id}</td>
+            <td>${t.side}</td>
+            <td>${fmt(t.entry, 5)}</td>
+            <td>${fmt(t.sl, 5)}</td>
+            <td>${fmt(t.tp, 5)}</td>
+            <td>${t.units}</td>
+            <td>${fmt(t.margin_used, 0)} €</td>
+          </tr>`;
+        }
+        html += `</tbody></table>`;
+        document.getElementById('tradesBlock').innerHTML = html;
+      } else {
+        document.getElementById('tradesBlock').innerHTML = "No open trades";
+      }
+    }
+
+    async function loadHistory() {
+      const res = await fetch('/history?limit=200');
+      const rows = await res.json();
+
+      const labels = rows.map(r => (r.timestamp || "").slice(11, 19));
+      const pnl = rows.map(r => r.pnl_bp);
+      const price = rows.map(r => r.last_price);
+      const spread = rows.map(r => r.spread);
+
+      pnlChart.data.labels = labels;
+      pnlChart.data.datasets[0].data = pnl;
+      pnlChart.update();
+
+      priceChart.data.labels = labels;
+      priceChart.data.datasets[0].data = price;
+      priceChart.update();
+
+      spreadChart.data.labels = labels;
+      spreadChart.data.datasets[0].data = spread;
+      spreadChart.update();
+    }
+
+    async function loadLogs() {
+      const res = await fetch('/logs?lines=120');
+      const data = await res.json();
+      const box = document.getElementById('logsBlock');
+      box.textContent = (data.lines || []).join('\n');
+      box.scrollTop = box.scrollHeight;
+    }
+
+    async function init() {
+      pnlChart = createChart(document.getElementById('pnlChart'), 'PnL bp');
+      priceChart = createChart(document.getElementById('priceChart'), 'Mid Price');
+      spreadChart = createChart(document.getElementById('spreadChart'), 'Spread bp');
+
+      await loadState();
+      await loadHistory();
+      await loadLogs();
+
+      setInterval(loadState, 3000);
+      setInterval(loadHistory, 10000);
+      setInterval(loadLogs, 5000);
+    }
+
+    init();
+  </script>
 </body>
 </html>
