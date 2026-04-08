@@ -114,8 +114,17 @@ def save_state():
             elif ind.get("ltf_side") == -1:
                 side_txt = "DOWN"
 
+        bot_status = "running"
+        if secs_since_last_valid is None:
+            bot_status = "starting"
+        elif secs_since_last_valid > 180:
+            bot_status = "disconnected"
+        elif secs_since_last_valid > 60:
+            bot_status = "stale_feed"
+        elif secs_since_last_valid > 15:
+            bot_status = "degraded"
         data = {
-            "bot_status": "running",
+            "bot_status": bot_status,
             "account_id": ACCOUNT_ID,
             "use_demo": USE_DEMO,
             "symbol": SYMBOL_NAME,
@@ -1062,6 +1071,29 @@ class BosBot:
                 f"positionId={getattr(obj, 'positionId', None)} | "
                 f"accountId={getattr(obj, 'ctidTraderAccountId', None)}"
             )
+            return
+
+        if t == 2164 or obj_name == "ProtoOAAccountDisconnectEvent":
+            log.warning(
+                "AccountDisconnectEvent | "
+                f"accountId={getattr(obj, 'ctidTraderAccountId', None)} | "
+                f"reason={getattr(obj, 'reason', None)}"
+            )
+
+            self.ready_for_ticks = False
+            self.account_auth_ok = False
+            self.app_auth_ok = False
+            self._cancel_account_auth_timeout()
+            self._reset_market_state()
+
+            try:
+                self.client.stopService()
+            except Exception as e:
+                log.warning(f"No se pudo parar client tras AccountDisconnectEvent: {e}")
+
+            self._cancel_reconnect_call()
+            log.warning("Reiniciando conexion completa en 5s tras AccountDisconnectEvent...")
+            self.reconnect_call = reactor.callLater(5, self._connect)
             return
 
         if t == 2101 or obj_name == "ProtoOAApplicationAuthRes":
