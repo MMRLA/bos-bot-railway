@@ -1488,7 +1488,11 @@ class BosBot:
                 f"TP={trade.tp_price:.5f} ({trade.tp_bp:.1f}bp) | Activos: {state.n_open_trades}"
             )
 
-            self.amend_position_sltp(pos_id, trade.sl_price, trade.tp_price)
+            log.info(
+                f"  PROGRAMANDO AMEND SLTP EN 1.0s | positionId={pos_id} | "
+                f"SL={trade.sl_price:.5f} | TP={trade.tp_price:.5f}"
+            )
+            reactor.callLater(1.0, self.amend_position_sltp, pos_id, trade.sl_price, trade.tp_price)
             trade.sltp_sent = False
             return
 
@@ -1544,16 +1548,17 @@ class BosBot:
         req.ctidTraderAccountId = ACCOUNT_ID
         req.positionId = position_id
 
-        d = 100_000
-        req.stopLoss = int(round(sl_price * d))
-        req.takeProfit = int(round(tp_price * d))
+        # IMPORTANTE:
+        # En este endpoint stopLoss y takeProfit van como precios absolutos,
+        # no escalados por 100000.
+        req.stopLoss = float(round(sl_price, 5))
+        req.takeProfit = float(round(tp_price, 5))
 
         self.client.send(req).addErrback(self._on_error)
 
         log.info(
             f"  AMEND SLTP ENVIADO | positionId={position_id} | "
-            f"SL={sl_price:.5f} ({int(round(sl_price * d))}) | "
-            f"TP={tp_price:.5f} ({int(round(tp_price * d))})"
+            f"SL={req.stopLoss:.5f} | TP={req.takeProfit:.5f}"
         )
 
     def close_position(self, position_id):
