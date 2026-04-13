@@ -172,8 +172,10 @@ def save_state():
             ],
         }
 
+        data = clean_nan(data)
+
         with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+            json.dump(data, f, indent=2, allow_nan=False)
 
     except Exception as e:
         log.warning(f"Error guardando state: {e}")
@@ -197,8 +199,10 @@ def append_history():
             "side": ind.get("ltf_side") if ind else None,
         }
 
+        row = clean_nan(row)
+
         with open(HISTORY_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(row) + "\n")
+            f.write(json.dumps(row, allow_nan=False) + "\n")
 
     except Exception as e:
         log.warning(f"Error guardando history: {e}")
@@ -325,6 +329,17 @@ def safe_float(x, default=float("nan")):
         return float(x)
     except Exception:
         return default
+
+def clean_nan(obj):
+    if isinstance(obj, dict):
+        return {k: clean_nan(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [clean_nan(v) for v in obj]
+    elif isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return obj
+    return obj
 
 def px_to_bp(diff, price):
     if price is None or price <= 0:
@@ -1435,6 +1450,8 @@ class BosBot:
             return
 
         on_tick(bid, ask, ts, self)
+        if state.tick_count % 20 == 0:
+            save_state()
 
     def _on_execution(self, message):
         ev = Protobuf.extract(message)
@@ -1481,6 +1498,8 @@ class BosBot:
             state.open_trades[pos_id] = trade
             state._pending = None
             state.trades_total += 1
+            save_state()
+            append_history()
 
             log.info(
                 f"  TRADE ABIERTO ID={pos_id} {trade.side.upper()} {trade.units:,}u | "
@@ -1513,6 +1532,9 @@ class BosBot:
                 state.trades_win += 1
             else:
                 state.trades_loss += 1
+
+            save_state()
+            append_history()
 
             wr = state.trades_win / max(state.trades_total, 1) * 100
             log.info(
