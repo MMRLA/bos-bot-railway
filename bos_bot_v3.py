@@ -1287,6 +1287,9 @@ class BosBot:
             save_state()
             append_history()
 
+            # Reconcile periodico para capturar cierres SL/TP no detectados por execution event
+            self._reconcile()
+
             reactor.callLater(HEARTBEAT_SECS, heartbeat)
 
         reactor.callLater(HEARTBEAT_SECS, heartbeat)
@@ -1453,6 +1456,41 @@ class BosBot:
         if state.tick_count % 20 == 0:
             save_state()
 
+
+    def _finalize_trade_close(self, pos_id, close_price, reason="unknown"):
+        if pos_id not in state.open_trades:
+            return
+
+        trade = state.open_trades.pop(pos_id)
+
+        cp = trade.entry_price
+        if close_price is not None and not math.isnan(close_price) and close_price > 0:
+            cp = close_price
+
+        pnl_bp = (
+            ((trade.entry_price - cp) if trade.side == "sell" else (cp - trade.entry_price))
+            / trade.entry_price
+        ) * 10_000.0
+
+        state.pnl_bp_total += pnl_bp
+
+        if pnl_bp > 0:
+            state.trades_win += 1
+        else:
+            state.trades_loss += 1
+
+        wr = state.trades_win / max(state.trades_total, 1) * 100
+
+        log.info(
+            f"  TRADE CERRADO ID={pos_id} {trade.side.upper()} | reason={reason} | "
+            f"close={cp:.5f} | P&L={pnl_bp:+.1f}bp | WR={wr:.0f}% | "
+            f"Total={state.pnl_bp_total:+.1f}bp | Activos: {state.n_open_trades}"
+        )
+
+        # Update inmediato dashboard
+        save_state()
+        append_history()
+
     def _on_execution(self, message):
         ev = Protobuf.extract(message)
         pos = ev.position if hasattr(ev, "position") else None
@@ -1462,6 +1500,14 @@ class BosBot:
         pos_id = pos.positionId
         pos_status = getattr(pos, "positionStatus", None)
         actual_price = safe_float(getattr(pos, "price", None), default=float("nan"))
+
+        pos_volume = safe_float(getattr(pos, "volume", None), default=float("nan"))
+        execution_type = getattr(ev, "executionType", None)
+
+        log.info(
+            f"  EXEC_EVENT | pos_id={pos_id} | pos_status={pos_status} | "
+            f"price={actual_price} | volume={pos_volume} | execution_type={execution_type}"
+        )
 
         if pos_status == 1 and state._pending:
             p = state._pending
@@ -1498,6 +1544,8 @@ class BosBot:
             state.open_trades[pos_id] = trade
             state._pending = None
             state.trades_total += 1
+
+            # Update inmediato dashboard
             save_state()
             append_history()
 
@@ -1516,37 +1564,47 @@ class BosBot:
             return
 
         if pos_status == 2 and pos_id in state.open_trades:
-            trade = state.open_trades.pop(pos_id)
-
-            cp = trade.entry_price
-            if not math.isnan(actual_price) and actual_price > 0:
-                cp = actual_price
-
-            pnl_bp = (
-                ((trade.entry_price - cp) if trade.side == "sell" else (cp - trade.entry_price))
-                / trade.entry_price
-            ) * 10_000.0
-
-            state.pnl_bp_total += pnl_bp
-            if pnl_bp > 0:
-                state.trades_win += 1
-            else:
-                state.trades_loss += 1
-
-            save_state()
-            append_history()
-
-            wr = state.trades_win / max(state.trades_total, 1) * 100
-            log.info(
-                f"  TRADE CERRADO ID={pos_id} {trade.side.upper()} | close={cp:.5f} | "
-                f"P&L={pnl_bp:+.1f}bp | WR={wr:.0f}% | Total={state.pnl_bp_total:+.1f}bp | "
-                f"Activos: {state.n_open_trades}"
-            )
+            self._finalize_trade_close(pos_id, actual_price, reason="execution_event")
+            return
 
     def _on_reconcile(self, message):
         rec = Protobuf.extract(message)
-        n = len(rec.position) if rec.position else 0
-        log.info(f"Reconcile: {n} posiciones abiertas al conectar.")
+
+        server_positions = list(rec.position) if rec.position else []
+        server_open_ids = set()
+
+        for p in server_positions:
+            try:
+                server_open_ids.add(p.positionId)
+            except Exception:
+                pass
+
+        local_open_ids = set(state.open_trades.keys())
+
+        log.info(
+            f"Reconcile: server_open={len(server_open_ids)} | local_open={len(local_open_ids)}"
+        )
+
+        # Si una posicion local ya no existe en servidor, asumir cerrada
+        missing_ids = local_open_ids - server_open_ids
+
+        for pos_id in list(missing_ids):
+            trade = state.open_trades.get(pos_id)
+            if trade is None:
+                continue
+
+            # precio fallback si no tenemos execution event de cierre
+            if trade.side == "buy":
+                fallback_close = state.last_bid if state.last_bid is not None else state.last_mid
+            else:
+                fallback_close = state.last_ask if state.last_ask is not None else state.last_mid
+
+            log.warning(
+                f"  Reconcile detecta cierre externo/no capturado | "
+                f"positionId={pos_id} | fallback_close={fallback_close}"
+            )
+
+            self._finalize_trade_close(pos_id, fallback_close, reason="reconcile_missing")
 
     def send_order(self, side, units):
         req = ProtoOANewOrderReq()
