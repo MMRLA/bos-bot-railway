@@ -952,6 +952,9 @@ class BosBot:
             }
             state.current_bar_valid_ticks = 0
             log.info("Timer UTC: cierre/rollover horario H1 ejecutado.")
+            log.info(
+                f"PROGRAMANDO FETCH H1 BROKER EN {BROKER_H1_FETCH_DELAY_SECS}s TRAS CIERRE HORARIO"
+            )
             reactor.callLater(BROKER_H1_FETCH_DELAY_SECS, self._fetch_broker_h1_after_close)
 
     def _on_connected(self, client):
@@ -1379,6 +1382,7 @@ class BosBot:
             log.warning(f"Precarga no disponible: {e}. El bot calentara con datos en vivo (~{state.n_bars_needed()}h).")
 
     def _fetch_broker_h1_after_close(self):
+        log.info("ENTRANDO EN _fetch_broker_h1_after_close()")
         try:
             req = ProtoOAGetTrendbarsReq()
             req.ctidTraderAccountId = ACCOUNT_ID
