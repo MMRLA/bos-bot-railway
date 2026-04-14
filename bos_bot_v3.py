@@ -1557,21 +1557,38 @@ class BosBot:
         if state.tick_count % 20 == 0:
             save_state()
 
-
     def _finalize_trade_close(self, pos_id, close_price, reason="unknown"):
         if pos_id not in state.open_trades:
             return
 
         trade = state.open_trades.pop(pos_id)
 
-        cp = trade.entry_price
+        # ---------------------------------------------------------
+        # Elegir precio de cierre
+        # 1) usar close_price si viene bien informado (>0)
+        # 2) si no, usar fallback con bid/ask segun el lado
+        #    - buy cierra contra BID
+        #    - sell cierra contra ASK
+        # ---------------------------------------------------------
         if close_price is not None and not math.isnan(close_price) and close_price > 0:
             cp = close_price
+            px_source = "event_price"
+        else:
+            if trade.side == "buy":
+                cp = state.last_bid if state.last_bid is not None else state.last_mid
+                px_source = "fallback_bid"
+            else:
+                cp = state.last_ask if state.last_ask is not None else state.last_mid
+                px_source = "fallback_ask"
+
+            if cp is None or (isinstance(cp, float) and (math.isnan(cp) or cp <= 0)):
+                cp = trade.entry_price
+                px_source = "entry_fallback"
 
         pnl_bp = (
-            ((trade.entry_price - cp) if trade.side == "sell" else (cp - trade.entry_price))
-            / trade.entry_price
-        ) * 10_000.0
+                         ((trade.entry_price - cp) if trade.side == "sell" else (cp - trade.entry_price))
+                         / trade.entry_price
+                 ) * 10_000.0
 
         state.pnl_bp_total += pnl_bp
 
@@ -1584,8 +1601,8 @@ class BosBot:
 
         log.info(
             f"  TRADE CERRADO ID={pos_id} {trade.side.upper()} | reason={reason} | "
-            f"close={cp:.5f} | P&L={pnl_bp:+.1f}bp | WR={wr:.0f}% | "
-            f"Total={state.pnl_bp_total:+.1f}bp | Activos: {state.n_open_trades}"
+            f"px_source={px_source} | close={cp:.5f} | P&L={pnl_bp:+.1f}bp | "
+            f"WR={wr:.0f}% | Total={state.pnl_bp_total:+.1f}bp | Activos: {state.n_open_trades}"
         )
 
         # Update inmediato dashboard
