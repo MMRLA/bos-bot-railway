@@ -1739,7 +1739,10 @@ class BosBot:
             f"Reconcile: server_open={len(server_open_ids)} | local_open={len(local_open_ids)}"
         )
 
-        # Si una posicion local ya no existe en servidor, asumir cerrada
+        # ---------------------------------------------------------
+        # 1) CIERRES PERDIDOS:
+        # posicion local ya no existe en servidor
+        # ---------------------------------------------------------
         missing_ids = local_open_ids - server_open_ids
 
         for pos_id in list(missing_ids):
@@ -1747,7 +1750,6 @@ class BosBot:
             if trade is None:
                 continue
 
-            # precio fallback si no tenemos execution event de cierre
             if trade.side == "buy":
                 fallback_close = state.last_bid if state.last_bid is not None else state.last_mid
             else:
@@ -1759,6 +1761,67 @@ class BosBot:
             )
 
             self._finalize_trade_close(pos_id, fallback_close, reason="reconcile_missing")
+
+        # ---------------------------------------------------------
+        # 2) APERTURAS PERDIDAS:
+        # posicion existe en servidor pero no en local
+        # ---------------------------------------------------------
+        new_ids = server_open_ids - local_open_ids
+
+        for p in server_positions:
+            try:
+                pos_id = p.positionId
+            except Exception:
+                continue
+
+            if pos_id not in new_ids:
+                continue
+
+            try:
+                side_enum = getattr(p, "tradeSide", None)
+                side = "buy" if side_enum == ProtoOATradeSide.BUY else "sell"
+
+                entry_price = safe_float(getattr(p, "price", None), default=float("nan"))
+                volume_raw = safe_float(getattr(p, "volume", None), default=float("nan"))
+
+                # volumen cTrader suele venir en centi-units
+                units = 0
+                if not math.isnan(volume_raw) and volume_raw > 0:
+                    units = int(volume_raw / 100)
+
+                # fallback por si precio/volumen no vienen bien
+                if math.isnan(entry_price) or entry_price <= 0:
+                    entry_price = state.last_mid if state.last_mid is not None else 0.0
+
+                margin_used = 0.0
+                if entry_price > 0 and units > 0:
+                    margin_used = units * entry_price / LEVERAGE
+
+                recovered_trade = OpenTrade(
+                    position_id=pos_id,
+                    side=side,
+                    entry_price=entry_price,
+                    sl_price=0.0,
+                    tp_price=0.0,
+                    sl_bp=0.0,
+                    tp_bp=0.0,
+                    units=units,
+                    entry_bar_idx=state.n_bars,
+                    margin_used=margin_used,
+                )
+
+                state.open_trades[pos_id] = recovered_trade
+
+                log.warning(
+                    f"  Reconcile recupera apertura perdida | "
+                    f"positionId={pos_id} | side={side} | entry={entry_price:.5f} | units={units}"
+                )
+
+            except Exception as e:
+                log.warning(f"  Error reconstruyendo posicion desde reconcile | positionId={pos_id} | err={e}")
+
+        # actualizar dashboard si hubo cambios
+        save_state()
 
     def send_order(self, side, units):
         req = ProtoOANewOrderReq()
