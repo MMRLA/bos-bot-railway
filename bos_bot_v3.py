@@ -872,6 +872,10 @@ class BosBot:
         self.last_ask = None
         self.last_ts = None
 
+        state.last_local_closed_bar = None
+        state.pending_broker_h1_fetch = False
+        state.last_broker_h1_bar_time = None
+
     def _seed_current_bar_after_historical(self, fallback_close):
         now_ts = self.last_ts if self.last_ts is not None else now_utc_ts()
         bar_start = get_bar_start(now_ts)
@@ -952,10 +956,16 @@ class BosBot:
             }
             state.current_bar_valid_ticks = 0
             log.info("Timer UTC: cierre/rollover horario H1 ejecutado.")
+
+            state.pending_broker_h1_fetch = True
+
             log.info(
                 f"PROGRAMANDO FETCH H1 BROKER EN {BROKER_H1_FETCH_DELAY_SECS}s TRAS CIERRE HORARIO"
             )
-            reactor.callLater(BROKER_H1_FETCH_DELAY_SECS, self._fetch_broker_h1_after_close)
+            reactor.callLater(
+                BROKER_H1_FETCH_DELAY_SECS,
+                self._fetch_broker_h1_after_close
+            )
 
     def _on_connected(self, client):
         log.info("Conectado. Autenticando aplicacion...")
@@ -1383,6 +1393,11 @@ class BosBot:
 
     def _fetch_broker_h1_after_close(self):
         log.info("ENTRANDO EN _fetch_broker_h1_after_close()")
+
+        if not state.pending_broker_h1_fetch:
+            log.warning("Fetch H1 broker ignorado: pending flag = False")
+            return
+
         try:
             req = ProtoOAGetTrendbarsReq()
             req.ctidTraderAccountId = ACCOUNT_ID
@@ -1395,8 +1410,6 @@ class BosBot:
 
             req.fromTimestamp = from_ms
             req.toTimestamp = now_ms
-
-            state.pending_broker_h1_fetch = True
 
             self.client.send(req).addErrback(self._on_error)
 
@@ -1453,7 +1466,14 @@ class BosBot:
             if state.pending_broker_h1_fetch:
                 state.pending_broker_h1_fetch = False
 
-                broker_last_closed = dedup[-1]
+                current_hour_start = get_bar_start(now_utc_ts())
+                closed_candidates = [b for b in dedup if b["time"] < current_hour_start]
+
+                if not closed_candidates:
+                    log.warning("No hay barras broker cerradas validas para comparar.")
+                    return
+
+                broker_last_closed = closed_candidates[-1]
                 state.last_broker_h1_bar_time = broker_last_closed["time"]
 
                 log.info(
