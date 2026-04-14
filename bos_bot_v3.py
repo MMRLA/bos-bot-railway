@@ -393,6 +393,34 @@ def normalize_spot_timestamp(raw_ts_ms: Optional[int]) -> int:
         state.spot_ts_fallback_count += 1
         return now_ts
 
+def safe_int(x, default=0):
+    try:
+        return int(x)
+    except Exception:
+        return default
+
+def proto_volume_to_units(volume_proto):
+    v = safe_float(volume_proto, default=float("nan"))
+    if math.isnan(v) or v <= 0:
+        return 0
+    return int(round(v / 100.0))
+
+def normalize_price_field(x):
+    px = safe_float(x, default=float("nan"))
+    if math.isnan(px) or px <= 0:
+        return 0.0
+
+    # Si viniera escalado estilo 118084, convertirlo a 1.18084
+    if px > 100:
+        return px / 100000.0
+
+    return px
+
+def calc_margin_for_units(units, entry_price):
+    if units <= 0 or entry_price <= 0:
+        return 0.0
+    return units * entry_price / LEVERAGE
+
 # =============================================================================
 # INDICADORES
 # =============================================================================
@@ -1730,6 +1758,19 @@ class BosBot:
         for p in server_positions:
             try:
                 server_open_ids.add(p.positionId)
+
+                log.info(
+                    "RECONCILE_POS_DEBUG | "
+                    f"positionId={getattr(p, 'positionId', None)} | "
+                    f"price={getattr(p, 'price', None)} | "
+                    f"volume={getattr(p, 'volume', None)} | "
+                    f"tradeSide={getattr(p, 'tradeSide', None)} | "
+                    f"stopLoss={getattr(p, 'stopLoss', None)} | "
+                    f"takeProfit={getattr(p, 'takeProfit', None)} | "
+                    f"marginRate={getattr(p, 'marginRate', None)} | "
+                    f"commission={getattr(p, 'commission', None)} | "
+                    f"swap={getattr(p, 'swap', None)}"
+                )
             except Exception:
                 pass
 
@@ -1743,6 +1784,7 @@ class BosBot:
         # 1) CIERRES PERDIDOS:
         # posicion local ya no existe en servidor
         # ---------------------------------------------------------
+        # Si una posicion local ya no existe en servidor, asumir cerrada
         missing_ids = local_open_ids - server_open_ids
 
         for pos_id in list(missing_ids):
@@ -1761,6 +1803,66 @@ class BosBot:
             )
 
             self._finalize_trade_close(pos_id, fallback_close, reason="reconcile_missing")
+
+        # Si una posicion existe en broker pero no en estado local, recuperarla
+        lost_open_ids = server_open_ids - local_open_ids
+
+        for p in server_positions:
+            try:
+                pos_id = p.positionId
+            except Exception:
+                continue
+
+            if pos_id not in lost_open_ids:
+                continue
+
+            trade_side_raw = getattr(p, "tradeSide", None)
+            side = "buy" if trade_side_raw == ProtoOATradeSide.BUY else "sell"
+
+            entry_price = normalize_price_field(getattr(p, "price", None))
+            if entry_price <= 0:
+                entry_price = state.last_mid if state.last_mid is not None else 0.0
+
+            units = proto_volume_to_units(getattr(p, "volume", None))
+            margin_used = calc_margin_for_units(units, entry_price)
+
+            sl_price = normalize_price_field(getattr(p, "stopLoss", None))
+            tp_price = normalize_price_field(getattr(p, "takeProfit", None))
+
+            sl_bp = 0.0
+            tp_bp = 0.0
+
+            if sl_price > 0 and entry_price > 0:
+                sl_bp = abs(px_to_bp(sl_price - entry_price, entry_price))
+
+            if tp_price > 0 and entry_price > 0:
+                tp_bp = abs(px_to_bp(tp_price - entry_price, entry_price))
+
+            recovered_trade = OpenTrade(
+                position_id=pos_id,
+                side=side,
+                entry_price=entry_price,
+                sl_price=sl_price,
+                tp_price=tp_price,
+                sl_bp=sl_bp,
+                tp_bp=tp_bp,
+                units=units,
+                entry_bar_idx=state.n_bars,
+                margin_used=margin_used,
+            )
+
+            state.open_trades[pos_id] = recovered_trade
+            state.trades_total += 1
+
+            log.warning(
+                f"  Reconcile recupera apertura perdida | "
+                f"positionId={pos_id} | side={side} | entry={entry_price:.5f} | "
+                f"units={units:,} | SL={sl_price:.5f} | TP={tp_price:.5f} | "
+                f"margin={margin_used:.0f}€"
+            )
+
+            save_state()
+            append_history()
 
         # ---------------------------------------------------------
         # 2) APERTURAS PERDIDAS:
