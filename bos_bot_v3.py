@@ -1828,12 +1828,31 @@ class BosBot:
             else:
                 side = "unknown"
 
+            # intentar desde tradeData (MUY IMPORTANTE en tu caso)
+            if side == "unknown" and hasattr(p, "tradeData"):
+                td_side = getattr(p.tradeData, "tradeSide", None)
+                if td_side == ProtoOATradeSide.BUY:
+                    side = "buy"
+                elif td_side == ProtoOATradeSide.SELL:
+                    side = "sell"
+
             entry_price = normalize_price_field(getattr(p, "price", None))
             if entry_price <= 0:
                 entry_price = state.last_mid if state.last_mid is not None else 0.0
 
-            units = proto_volume_to_units(getattr(p, "volume", None))
-            margin_used = calc_margin_for_units(units, entry_price)
+            # 1) intentar volume directo
+            volume_raw = getattr(p, "volume", None)
+
+            # 2) fallback a tradeData.volume (AQUÍ está en tu caso)
+            if (volume_raw is None or volume_raw == 0) and hasattr(p, "tradeData"):
+                volume_raw = getattr(p.tradeData, "volume", None)
+
+            units = proto_volume_to_units(volume_raw)
+
+            margin_used = safe_float(getattr(p, "usedMargin", None), default=float("nan"))
+
+            if math.isnan(margin_used) or margin_used <= 0:
+                margin_used = calc_margin_for_units(units, entry_price)
 
             sl_price = normalize_price_field(getattr(p, "stopLoss", None))
             tp_price = normalize_price_field(getattr(p, "takeProfit", None))
