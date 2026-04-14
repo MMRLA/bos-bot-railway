@@ -76,6 +76,10 @@ HISTORICAL_LOOKBACK_DAYS = 14
 
 HEARTBEAT_SECS = 30
 ACCOUNT_AUTH_TIMEOUT_SECS = 10
+USE_BROKER_H1_FOR_SIGNAL = False   # Fase 1: comparar solo, no usar aun para operar
+BROKER_H1_FETCH_DELAY_SECS = 2.0   # Espera tras la hora en punto para que la vela cierre bien en broker
+BROKER_H1_COMPARE_BARS = 200
+
 
 # =============================================================================
 # LOGGING
@@ -278,6 +282,10 @@ class BotState:
         self.hb_prev_reject_spread           = 0
         self.hb_prev_reject_not_ready        = 0
         self.hb_prev_ts_fallbacks            = 0
+
+        self.last_local_closed_bar: Optional[dict] = None
+        self.pending_broker_h1_fetch = False
+        self.last_broker_h1_bar_time: Optional[int] = None
 
     @property
     def n_bars(self):
@@ -623,6 +631,7 @@ def finalize_current_bar(bot):
         return
 
     state.add_bar(completed)
+    state.last_local_closed_bar = completed
     bar_dt = datetime.fromtimestamp(completed["time"], tz=timezone.utc)
 
     log.info(f"\n{'='*78}")
@@ -738,6 +747,56 @@ def on_bar_close(bar, bot):
         f"  Margen: {state.total_margin_used:.0f}€/{state.equity * MAX_MARGIN_PCT:.0f}€ | "
         f"Stats: {state.trades_total}T WR={wr:.0f}%"
     )
+
+def parse_trendbars_from_response(res):
+    loaded = []
+    for tb in list(res.trendbar):
+        d = 100_000
+
+        low_abs = getattr(tb, "low", None)
+        delta_open = getattr(tb, "deltaOpen", 0) or 0
+        delta_high = getattr(tb, "deltaHigh", 0) or 0
+        delta_close = getattr(tb, "deltaClose", None)
+
+        if low_abs is not None and low_abs > 0 and delta_close is not None:
+            low = low_abs / d
+            open_ = low + delta_open / d
+            high = low + delta_high / d
+            close = low + delta_close / d
+        else:
+            close = getattr(tb, "close", 0) / d if getattr(tb, "close", 0) else 0
+            if close <= 0:
+                continue
+            open_ = close + delta_open / d
+            high = close + delta_high / d
+            low = close + (getattr(tb, "deltaLow", 0) or 0) / d
+
+        if close <= 0:
+            continue
+
+        high = max(high, open_, close, low)
+        low = min(low, open_, close, high)
+
+        loaded.append({
+            "time": tb.utcTimestampInMinutes * 60,
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "bid": close,
+            "ask": close,
+        })
+
+    loaded.sort(key=lambda x: x["time"])
+
+    dedup = []
+    seen = set()
+    for bar in loaded:
+        if bar["time"] not in seen:
+            dedup.append(bar)
+            seen.add(bar["time"])
+
+    return dedup
 
 # =============================================================================
 # CLIENTE CTRADER
@@ -893,6 +952,7 @@ class BosBot:
             }
             state.current_bar_valid_ticks = 0
             log.info("Timer UTC: cierre/rollover horario H1 ejecutado.")
+            reactor.callLater(BROKER_H1_FETCH_DELAY_SECS, self._fetch_broker_h1_after_close)
 
     def _on_connected(self, client):
         log.info("Conectado. Autenticando aplicacion...")
@@ -1318,6 +1378,57 @@ class BosBot:
         except Exception as e:
             log.warning(f"Precarga no disponible: {e}. El bot calentara con datos en vivo (~{state.n_bars_needed()}h).")
 
+    def _fetch_broker_h1_after_close(self):
+        try:
+            req = ProtoOAGetTrendbarsReq()
+            req.ctidTraderAccountId = ACCOUNT_ID
+            req.symbolId = state.symbol_id
+            req.period = ProtoOATrendbarPeriod.H1
+            req.count = BROKER_H1_COMPARE_BARS
+
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+            from_ms = now_ms - HISTORICAL_LOOKBACK_DAYS * 24 * 3600 * 1000
+
+            req.fromTimestamp = from_ms
+            req.toTimestamp = now_ms
+
+            state.pending_broker_h1_fetch = True
+
+            self.client.send(req).addErrback(self._on_error)
+
+            log.info(
+                f"Solicitando H1 broker post-cierre | symbolId={state.symbol_id} | "
+                f"delay={BROKER_H1_FETCH_DELAY_SECS}s | count={BROKER_H1_COMPARE_BARS}"
+            )
+        except Exception as e:
+            state.pending_broker_h1_fetch = False
+            log.warning(f"No se pudo pedir H1 broker post-cierre: {e}")
+
+    def _compare_local_vs_broker_bar(self, broker_bar):
+        local_bar = state.last_local_closed_bar
+        if local_bar is None or broker_bar is None:
+            return
+
+        if local_bar["time"] != broker_bar["time"]:
+            log.warning(
+                f"COMPARE H1 | tiempos distintos | "
+                f"local={fmt_dt_utc(local_bar['time'])} | broker={fmt_dt_utc(broker_bar['time'])}"
+            )
+            return
+
+        def diff_bp(a, b):
+            mid = broker_bar["close"] if broker_bar["close"] > 0 else 1.0
+            return px_to_bp(a - b, mid)
+
+        log.info(
+            "COMPARE H1 | "
+            f"time={fmt_dt_utc(broker_bar['time'])} | "
+            f"dO={diff_bp(local_bar['open'], broker_bar['open']):+.3f}bp | "
+            f"dH={diff_bp(local_bar['high'], broker_bar['high']):+.3f}bp | "
+            f"dL={diff_bp(local_bar['low'], broker_bar['low']):+.3f}bp | "
+            f"dC={diff_bp(local_bar['close'], broker_bar['close']):+.3f}bp"
+        )
+
     def _on_historical_bars(self, message):
         try:
             res = Protobuf.extract(message)
@@ -1326,53 +1437,35 @@ class BosBot:
                 log.warning("El servidor no devolvio barras historicas.")
                 return
 
-            loaded = []
-            for tb in bars_data:
-                d = 100_000
+            dedup = parse_trendbars_from_response(res)
 
-                low_abs = getattr(tb, "low", None)
-                delta_open = getattr(tb, "deltaOpen", 0) or 0
-                delta_high = getattr(tb, "deltaHigh", 0) or 0
-                delta_close = getattr(tb, "deltaClose", None)
+            if not dedup:
+                log.warning("No se pudieron parsear barras historicas validas.")
+                return
 
-                if low_abs is not None and low_abs > 0 and delta_close is not None:
-                    low = low_abs / d
-                    open_ = low + delta_open / d
-                    high = low + delta_high / d
-                    close = low + delta_close / d
-                else:
-                    close = getattr(tb, "close", 0) / d if getattr(tb, "close", 0) else 0
-                    if close <= 0:
-                        continue
-                    open_ = close + delta_open / d
-                    high = close + delta_high / d
-                    low = close + (getattr(tb, "deltaLow", 0) or 0) / d
+            # -------------------------------------------------------------
+            # CASO 1: fetch horario post-cierre para comparar barra broker
+            # -------------------------------------------------------------
+            if state.pending_broker_h1_fetch:
+                state.pending_broker_h1_fetch = False
 
-                if close <= 0:
-                    continue
+                broker_last_closed = dedup[-1]
+                state.last_broker_h1_bar_time = broker_last_closed["time"]
 
-                high = max(high, open_, close, low)
-                low  = min(low, open_, close, high)
+                log.info(
+                    f"H1 broker post-cierre recibida | "
+                    f"time={fmt_dt_utc(broker_last_closed['time'])} | "
+                    f"O={broker_last_closed['open']:.5f} H={broker_last_closed['high']:.5f} "
+                    f"L={broker_last_closed['low']:.5f} C={broker_last_closed['close']:.5f}"
+                )
 
-                loaded.append({
-                    "time":  tb.utcTimestampInMinutes * 60,
-                    "open":  open_,
-                    "high":  high,
-                    "low":   low,
-                    "close": close,
-                    "bid":   close,
-                    "ask":   close,
-                })
+                self._compare_local_vs_broker_bar(broker_last_closed)
+                return
 
-            loaded.sort(key=lambda x: x["time"])
-
-            dedup = []
-            seen = set()
-            for bar in loaded:
-                if bar["time"] not in seen:
-                    dedup.append(bar)
-                    seen.add(bar["time"])
-
+            # -------------------------------------------------------------
+            # CASO 2: carga inicial / precarga historica normal
+            # -------------------------------------------------------------
+            state.bars = []
             for bar in dedup[-state.max_bars:]:
                 state.add_bar(bar)
 
@@ -1386,7 +1479,10 @@ class BosBot:
             log.info(f"Precarga completada: {len(dedup)} barras H1 cargadas.")
 
             if len(dedup) >= 2:
-                log.info(f"Rango historico cargado: {fmt_dt_utc(dedup[0]['time'])} -> {fmt_dt_utc(dedup[-1]['time'])}")
+                log.info(
+                    f"Rango historico cargado: "
+                    f"{fmt_dt_utc(dedup[0]['time'])} -> {fmt_dt_utc(dedup[-1]['time'])}"
+                )
 
             if state.is_warmed_up():
                 log.info("INDICADORES LISTOS. El bot puede operar desde la proxima barra.")
@@ -1394,13 +1490,18 @@ class BosBot:
                 if not math.isnan(ind.get("atr_bp", float("nan"))):
                     log.info(
                         f"  Estado actual: ATR={ind['atr_bp']:.1f}bp | ADX={ind['adx']:.1f} | "
-                        f"Lado={'UP' if ind['ltf_side']==1 else 'DOWN'} | Swing={ind['swing_range_bp']:.1f}bp"
+                        f"Lado={'UP' if ind['ltf_side']==1 else 'DOWN'} | "
+                        f"Swing={ind['swing_range_bp']:.1f}bp"
                     )
             else:
                 faltan = needed - state.n_bars
-                log.info(f"Calentamiento parcial: {state.n_bars}/{needed}. Faltan {faltan} barras (~{faltan}h con datos en vivo).")
+                log.info(
+                    f"Calentamiento parcial: {state.n_bars}/{needed}. "
+                    f"Faltan {faltan} barras (~{faltan}h con datos en vivo)."
+                )
 
         except Exception as e:
+            state.pending_broker_h1_fetch = False
             log.error(f"Error procesando barras historicas: {e}", exc_info=True)
 
     def _reconcile(self):
