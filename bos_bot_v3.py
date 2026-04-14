@@ -933,6 +933,12 @@ class BosBot:
         state.current_bar_valid_ticks = 0
 
     def _schedule_broker_h1_fetch_after_close(self):
+        if state.pending_broker_h1_fetch:
+            log.info("Fetch H1 broker ya pendiente; no se duplica.")
+            return
+
+        state.pending_broker_h1_fetch = True
+
         log.info(
             f"PROGRAMANDO FETCH H1 BROKER EN {BROKER_H1_FETCH_DELAY_SECS}s TRAS CIERRE HORARIO"
         )
@@ -1423,12 +1429,6 @@ class BosBot:
     def _fetch_broker_h1_after_close(self):
         log.info("ENTRANDO EN _fetch_broker_h1_after_close()")
 
-        if state.pending_broker_h1_fetch:
-            log.warning("Fetch H1 broker ya en curso; se ignora duplicado.")
-            return
-
-        state.pending_broker_h1_fetch = True
-
         try:
             req = ProtoOAGetTrendbarsReq()
             req.ctidTraderAccountId = ACCOUNT_ID
@@ -1864,63 +1864,7 @@ class BosBot:
             save_state()
             append_history()
 
-        # ---------------------------------------------------------
-        # 2) APERTURAS PERDIDAS:
-        # posicion existe en servidor pero no en local
-        # ---------------------------------------------------------
-        new_ids = server_open_ids - local_open_ids
 
-        for p in server_positions:
-            try:
-                pos_id = p.positionId
-            except Exception:
-                continue
-
-            if pos_id not in new_ids:
-                continue
-
-            try:
-                side_enum = getattr(p, "tradeSide", None)
-                side = "buy" if side_enum == ProtoOATradeSide.BUY else "sell"
-
-                entry_price = safe_float(getattr(p, "price", None), default=float("nan"))
-                volume_raw = safe_float(getattr(p, "volume", None), default=float("nan"))
-
-                # volumen cTrader suele venir en centi-units
-                units = 0
-                if not math.isnan(volume_raw) and volume_raw > 0:
-                    units = int(volume_raw / 100)
-
-                # fallback por si precio/volumen no vienen bien
-                if math.isnan(entry_price) or entry_price <= 0:
-                    entry_price = state.last_mid if state.last_mid is not None else 0.0
-
-                margin_used = 0.0
-                if entry_price > 0 and units > 0:
-                    margin_used = units * entry_price / LEVERAGE
-
-                recovered_trade = OpenTrade(
-                    position_id=pos_id,
-                    side=side,
-                    entry_price=entry_price,
-                    sl_price=0.0,
-                    tp_price=0.0,
-                    sl_bp=0.0,
-                    tp_bp=0.0,
-                    units=units,
-                    entry_bar_idx=state.n_bars,
-                    margin_used=margin_used,
-                )
-
-                state.open_trades[pos_id] = recovered_trade
-
-                log.warning(
-                    f"  Reconcile recupera apertura perdida | "
-                    f"positionId={pos_id} | side={side} | entry={entry_price:.5f} | units={units}"
-                )
-
-            except Exception as e:
-                log.warning(f"  Error reconstruyendo posicion desde reconcile | positionId={pos_id} | err={e}")
 
         # actualizar dashboard si hubo cambios
         save_state()
