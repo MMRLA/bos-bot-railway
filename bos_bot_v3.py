@@ -1852,7 +1852,6 @@ class BosBot:
             )
 
             state.open_trades[pos_id] = recovered_trade
-            state.trades_total += 1
 
             log.warning(
                 f"  Reconcile recupera apertura perdida | "
