@@ -1764,12 +1764,15 @@ class BosBot:
                     f"positionId={getattr(p, 'positionId', None)} | "
                     f"price={getattr(p, 'price', None)} | "
                     f"volume={getattr(p, 'volume', None)} | "
+                    f"lotSize={getattr(p, 'lotSize', None)} | "
+                    f"tradeData={getattr(p, 'tradeData', None)} | "
                     f"tradeSide={getattr(p, 'tradeSide', None)} | "
                     f"stopLoss={getattr(p, 'stopLoss', None)} | "
                     f"takeProfit={getattr(p, 'takeProfit', None)} | "
                     f"marginRate={getattr(p, 'marginRate', None)} | "
                     f"commission={getattr(p, 'commission', None)} | "
-                    f"swap={getattr(p, 'swap', None)}"
+                    f"swap={getattr(p, 'swap', None)} | "
+                    f"raw={p}"
                 )
             except Exception:
                 pass
@@ -1817,7 +1820,13 @@ class BosBot:
                 continue
 
             trade_side_raw = getattr(p, "tradeSide", None)
-            side = "buy" if trade_side_raw == ProtoOATradeSide.BUY else "sell"
+
+            if trade_side_raw == ProtoOATradeSide.BUY:
+                side = "buy"
+            elif trade_side_raw == ProtoOATradeSide.SELL:
+                side = "sell"
+            else:
+                side = "unknown"
 
             entry_price = normalize_price_field(getattr(p, "price", None))
             if entry_price <= 0:
@@ -1828,6 +1837,12 @@ class BosBot:
 
             sl_price = normalize_price_field(getattr(p, "stopLoss", None))
             tp_price = normalize_price_field(getattr(p, "takeProfit", None))
+
+            if side == "unknown" and entry_price > 0 and sl_price > 0 and tp_price > 0:
+                if sl_price > entry_price and tp_price < entry_price:
+                    side = "sell"
+                elif sl_price < entry_price and tp_price > entry_price:
+                    side = "buy"
 
             sl_bp = 0.0
             tp_bp = 0.0
