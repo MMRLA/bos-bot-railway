@@ -715,8 +715,10 @@ def on_tick(bid, ask, ts, bot):
         cb["bid"] = bid
         cb["ask"] = ask
         state.current_bar_valid_ticks += 1
+
     else:
-        finalize_current_bar(bot)
+        # NO cerramos aquí; dejamos que lo haga el timer UTC
+        pass
 
         state.current_bar_start = bar_start
         state.current_bar = {
