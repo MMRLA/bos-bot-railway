@@ -76,7 +76,7 @@ HISTORICAL_LOOKBACK_DAYS = 14
 
 HEARTBEAT_SECS = 30
 ACCOUNT_AUTH_TIMEOUT_SECS = 10
-USE_BROKER_H1_FOR_SIGNAL = True   # Fase 1: comparar solo, no usar aun para operar
+USE_BROKER_H1_FOR_SIGNAL = True   # usar barra broker H1 para señal y operacion   # False solo comparar, no usar para operar
 BROKER_H1_FETCH_DELAY_SECS = 2.0   # Espera tras la hora en punto para que la vela cierre bien en broker
 BROKER_H1_COMPARE_BARS = 200
 
@@ -678,7 +678,10 @@ def finalize_current_bar(bot):
     if state.current_bar_valid_ticks <= 1:
         log.warning("  AVISO: la barra se ha construido con 0/1 ticks validos. Revisa feed/spread/symbolId.")
 
-    on_bar_close(completed, bot)
+    if not USE_BROKER_H1_FOR_SIGNAL:
+        on_bar_close(completed, bot)
+    else:
+        log.info("Cierre local H1 registrado solo para monitorizacion; señal esperará a barra broker.")
 
 def on_tick(bid, ask, ts, bot):
     state.tick_count += 1
@@ -727,8 +730,7 @@ def on_tick(bid, ask, ts, bot):
         }
         state.current_bar_valid_ticks = 1
 
-        if hasattr(bot, "_schedule_broker_h1_fetch_after_close"):
-            bot._schedule_broker_h1_fetch_after_close()
+
 
 def on_bar_close(bar, bot):
     to_close = []
@@ -1867,10 +1869,17 @@ class BosBot:
             units = proto_volume_to_units(volume_raw)
 
             if units <= 0:
-                log.warning(f"Reconcile: volume invalido, intentando fallback conservador | positionId={pos_id}")
-                units = 1000  # mínimo para no romper lógica
+                log.warning(f"Reconcile: no se pudo reconstruir units | positionId={pos_id}")
+                continue
 
-            margin_used = safe_float(getattr(p, "usedMargin", None), default=float("nan"))
+            margin_used_raw = safe_float(getattr(p, "usedMargin", None), default=float("nan"))
+            money_digits = safe_int(getattr(p, "moneyDigits", None), default=2)
+
+            if not math.isnan(margin_used_raw) and margin_used_raw > 0:
+                margin_used = margin_used_raw / (10 ** money_digits)
+            else:
+                margin_used = calc_margin_for_units(units, entry_price)
+
 
             if math.isnan(margin_used) or margin_used <= 0:
                 margin_used = calc_margin_for_units(units, entry_price)
