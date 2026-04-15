@@ -954,21 +954,16 @@ class BosBot:
 
         self.hourly_timer_started = True
 
-        def schedule_next():
-            now_ts = now_utc_ts()
-            secs_to_next = BAR_SECONDS - (now_ts % BAR_SECONDS)
-            if secs_to_next <= 0:
-                secs_to_next = BAR_SECONDS
-            reactor.callLater(secs_to_next + 0.2, hourly_check)
-
-        def hourly_check():
+        def hourly_check_loop():
             try:
                 self._on_hour_boundary()
+            except Exception as e:
+                log.error(f"Error en hourly_check_loop: {e}", exc_info=True)
             finally:
-                schedule_next()
+                reactor.callLater(1.0, hourly_check_loop)
 
-        schedule_next()
-        log.info("Timer horario UTC activo para cierre de barra H1.")
+        reactor.callLater(1.0, hourly_check_loop)
+        log.info("Timer horario UTC activo (check cada 1s).")
 
     def _on_hour_boundary(self):
         if not self.ready_for_ticks:
@@ -979,7 +974,7 @@ class BosBot:
         now_ts = now_utc_ts()
         current_hour_start = get_bar_start(now_ts)
 
-        if state.current_bar_start < current_hour_start:
+        if state.current_bar_start is not None and state.current_bar_start != current_hour_start:
             finalize_current_bar(self)
 
             if self.last_bid is not None and self.last_ask is not None:
