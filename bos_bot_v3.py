@@ -76,7 +76,7 @@ HISTORICAL_LOOKBACK_DAYS = 14
 
 HEARTBEAT_SECS = 30
 ACCOUNT_AUTH_TIMEOUT_SECS = 10
-USE_BROKER_H1_FOR_SIGNAL = False   # Fase 1: comparar solo, no usar aun para operar
+USE_BROKER_H1_FOR_SIGNAL = True   # Fase 1: comparar solo, no usar aun para operar
 BROKER_H1_FETCH_DELAY_SECS = 2.0   # Espera tras la hora en punto para que la vela cierre bien en broker
 BROKER_H1_COMPARE_BARS = 200
 
@@ -1524,6 +1524,19 @@ class BosBot:
                     return
 
                 self._compare_local_vs_broker_bar(broker_last_closed)
+
+                if USE_BROKER_H1_FOR_SIGNAL:
+                    log.info("USANDO H1 BROKER PARA SEÑAL")
+
+                    # sustituir última barra local por broker
+                    if state.bars and state.bars[-1]["time"] == broker_last_closed["time"]:
+                        state.bars[-1] = broker_last_closed
+                    else:
+                        state.add_bar(broker_last_closed)
+
+                    # ejecutar lógica con barra broker
+                    on_bar_close(broker_last_closed, self)
+
                 return
 
             # -------------------------------------------------------------
@@ -1836,6 +1849,10 @@ class BosBot:
                 elif td_side == ProtoOATradeSide.SELL:
                     side = "sell"
 
+            # DEBUG FINAL: si sigue unknown
+            if side == "unknown":
+                log.warning(f"Reconcile: side sigue siendo unknown | positionId={pos_id}")
+
             entry_price = normalize_price_field(getattr(p, "price", None))
             if entry_price <= 0:
                 entry_price = state.last_mid if state.last_mid is not None else 0.0
@@ -1848,6 +1865,10 @@ class BosBot:
                 volume_raw = getattr(p.tradeData, "volume", None)
 
             units = proto_volume_to_units(volume_raw)
+
+            if units <= 0:
+                log.warning(f"Reconcile: volume invalido, intentando fallback conservador | positionId={pos_id}")
+                units = 1000  # mínimo para no romper lógica
 
             margin_used = safe_float(getattr(p, "usedMargin", None), default=float("nan"))
 
@@ -1872,6 +1893,11 @@ class BosBot:
             if tp_price > 0 and entry_price > 0:
                 tp_bp = abs(px_to_bp(tp_price - entry_price, entry_price))
 
+            # VALIDACION FINAL ENTRY PRICE
+            if entry_price <= 0:
+                log.warning(f"Reconcile: entry_price invalido | positionId={pos_id}")
+                continue
+
             recovered_trade = OpenTrade(
                 position_id=pos_id,
                 side=side,
@@ -1886,6 +1912,7 @@ class BosBot:
             )
 
             state.open_trades[pos_id] = recovered_trade
+            # IMPORTANTE: no incrementamos trades_total porque es una recuperación, no una apertura nueva
 
             log.warning(
                 f"  Reconcile recupera apertura perdida | "
