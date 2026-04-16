@@ -63,10 +63,10 @@ ADX_MIN_VAL   = 20.0
 ATR_MULT      = 1.5
 SL_MIN_BP     = 6.0
 SL_MAX_BP     = 25.0
-TP_RATIO      = 3.0
+TP_RATIO      = 1.0
 MAX_BARS_OPEN = 16
 COOLDOWN_BARS = 2
-RISK_PCT      = 0.005
+RISK_PCT      = 0.01
 LEVERAGE      = 30
 MAX_MARGIN_PCT= 0.40
 MAX_SPREAD_BP = 3.0
@@ -566,11 +566,11 @@ def evaluate_bos_signal(ind, bar):
     # Estrategia original: reversal del breakout
     if ltf == 1 and close > ind["swing_hi"]:
         log.info(f"  BOS ALCISTA: {close:.5f} > swing_hi={ind['swing_hi']:.5f}")
-        return "sell"
+        return "buy"
 
     if ltf == -1 and close < ind["swing_lo"]:
         log.info(f"  BOS BAJISTA: {close:.5f} < swing_lo={ind['swing_lo']:.5f}")
-        return "buy"
+        return "sell"
 
     return None
 
@@ -717,8 +717,12 @@ def on_tick(bid, ask, ts, bot):
         state.current_bar_valid_ticks += 1
 
     else:
-        # NO cerramos aquí; dejamos que lo haga el timer UTC
-        pass
+        # Si usamos barra broker para señal, NO rotamos aquí.
+        # Esperamos a que el timer UTC cierre la barra anterior y cree la nueva.
+        if USE_BROKER_H1_FOR_SIGNAL:
+            return
+
+        finalize_current_bar(bot)
 
         state.current_bar_start = bar_start
         state.current_bar = {
