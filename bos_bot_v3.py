@@ -1,13 +1,10 @@
 """
-IC Markets — EURUSD BOS Reversal Bot v6
-Cambios clave respecto a v5:
-  - FIX del amend SL/TP: enviar stopLoss / takeProfit en formato entero cTrader
-  - Log detallado de ProtoOAOrderErrorEvent
-  - No marcar sltp_sent=True de forma optimista tras enviar amend
-  - FIX timeout auth cuenta: guardar/cancelar callLater correctamente
-  - FIX reconnect: evitar reconnect timers duplicados
-  - FIX logging Twisted: timeouts no fatales no ensucian como error crítico
-  - Se preserva el resto del codigo y de la estrategia SIN CAMBIAR
+IC Markets — EURUSD BOS Reversal Bot v7
+Cambios respecto a v6:
+  - Estrategia adaptada al research final: filtro live exclude_depth_q4
+  - Construccion directa del feature pullback_depth_vs_sma10_bp (sin proxy)
+  - Logs ampliados del setup: SMA10, depth long/short, depth del setup candidato
+  - Se mantiene la infraestructura general, auth, reconcile, H1 broker, risk, SL/TP, dashboard, etc.
 """
 
 import logging
@@ -76,10 +73,17 @@ HISTORICAL_LOOKBACK_DAYS = 14
 
 HEARTBEAT_SECS = 30
 ACCOUNT_AUTH_TIMEOUT_SECS = 10
-USE_BROKER_H1_FOR_SIGNAL = True   # usar barra broker H1 para señal y operacion   # False solo comparar, no usar para operar
-BROKER_H1_FETCH_DELAY_SECS = 2.0   # Espera tras la hora en punto para que la vela cierre bien en broker
+USE_BROKER_H1_FOR_SIGNAL = True
+BROKER_H1_FETCH_DELAY_SECS = 2.0
 BROKER_H1_COMPARE_BARS = 200
 
+# -------------------------------------------------------------------------
+# RESEARCH FILTER: exclude_depth_q4
+# -------------------------------------------------------------------------
+USE_EXCLUDE_DEPTH_Q4_FILTER = True
+SMA_DEPTH_N = 10
+DEPTH_Q75_BP = 9.5923   # umbral obtenido en research
+REQUIRE_DEPTH_FEATURE_READY = True
 
 # =============================================================================
 # LOGGING
@@ -90,12 +94,14 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler("bos_bot_v6.log", encoding="utf-8"),
+        logging.FileHandler("bos_bot_v7.log", encoding="utf-8"),
     ]
 )
-log = logging.getLogger("BOS_v6")
+log = logging.getLogger("BOS_v7")
 
-
+# =============================================================================
+# DASHBOARD / STATE FILES
+# =============================================================================
 
 import json
 import os
@@ -127,6 +133,7 @@ def save_state():
             bot_status = "stale_feed"
         elif secs_since_last_valid > 15:
             bot_status = "degraded"
+
         data = {
             "bot_status": bot_status,
             "account_id": ACCOUNT_ID,
@@ -154,10 +161,19 @@ def save_state():
             "last_spot_age_sec": secs_since_last_spot,
             "last_valid_tick_age_sec": secs_since_last_valid,
             "timestamp": datetime.now(timezone.utc).isoformat(),
+            "strategy": {
+                "name": "bos_reversal_v7_research_depth_filter",
+                "use_exclude_depth_q4_filter": USE_EXCLUDE_DEPTH_Q4_FILTER,
+                "depth_q75_bp": DEPTH_Q75_BP,
+                "sma_depth_n": SMA_DEPTH_N,
+            },
             "indicators": {
                 "atr_bp": ind.get("atr_bp") if ind else None,
                 "adx": ind.get("adx") if ind else None,
                 "swing_range_bp": ind.get("swing_range_bp") if ind else None,
+                "sma10": ind.get("sma10") if ind else None,
+                "pullback_depth_long_bp": ind.get("pullback_depth_long_bp") if ind else None,
+                "pullback_depth_short_bp": ind.get("pullback_depth_short_bp") if ind else None,
                 "side": side_txt,
             },
             "open_trades": [
@@ -184,7 +200,6 @@ def save_state():
     except Exception as e:
         log.warning(f"Error guardando state: {e}")
 
-
 def append_history():
     try:
         ind = compute_indicators() if state.is_warmed_up() else {}
@@ -200,6 +215,9 @@ def append_history():
             "atr_bp": ind.get("atr_bp") if ind else None,
             "adx": ind.get("adx") if ind else None,
             "swing_range_bp": ind.get("swing_range_bp") if ind else None,
+            "sma10": ind.get("sma10") if ind else None,
+            "pullback_depth_long_bp": ind.get("pullback_depth_long_bp") if ind else None,
+            "pullback_depth_short_bp": ind.get("pullback_depth_short_bp") if ind else None,
             "side": ind.get("ltf_side") if ind else None,
         }
 
@@ -210,7 +228,6 @@ def append_history():
 
     except Exception as e:
         log.warning(f"Error guardando history: {e}")
-
 
 # =============================================================================
 # DATACLASSES
@@ -237,51 +254,51 @@ class OpenTrade:
 
 class BotState:
     def __init__(self):
-        self.bars: List[dict]                = []
-        self.max_bars                        = 200
+        self.bars: List[dict]                 = []
+        self.max_bars                         = 200
 
-        self.current_bar: Optional[dict]     = None
+        self.current_bar: Optional[dict]      = None
         self.current_bar_start: Optional[int] = None
-        self.current_bar_valid_ticks         = 0
+        self.current_bar_valid_ticks          = 0
 
         self.open_trades: Dict[int, OpenTrade] = {}
-        self.last_bos_bar                    = -100
+        self.last_bos_bar                     = -100
 
-        self.equity                          = 2000.0
-        self.symbol_id                       = DEFAULT_SYMBOL_ID
-        self.symbol_resolved                 = False
+        self.equity                           = 2000.0
+        self.symbol_id                        = DEFAULT_SYMBOL_ID
+        self.symbol_resolved                  = False
 
-        self.pip_size                        = 0.0001
+        self.pip_size                         = 0.0001
 
-        self.trades_total                    = 0
-        self.trades_win                      = 0
-        self.trades_loss                     = 0
-        self.pnl_bp_total                    = 0.0
+        self.trades_total                     = 0
+        self.trades_win                       = 0
+        self.trades_loss                      = 0
+        self.pnl_bp_total                     = 0.0
 
-        self._pending: Optional[dict]        = None
-        self.historical_loaded               = False
+        self._pending: Optional[dict]         = None
+        self.historical_loaded                = False
 
         # Feed / spots
-        self.tick_count                      = 0
-        self.raw_spot_count                  = 0
-        self.spot_reject_spread              = 0
-        self.spot_reject_not_ready           = 0
-        self.spot_ts_fallback_count          = 0
+        self.tick_count                       = 0
+        self.raw_spot_count                   = 0
+        self.spot_reject_spread               = 0
+        self.spot_reject_not_ready            = 0
+        self.spot_ts_fallback_count           = 0
 
-        self.last_spot_ts: Optional[int]     = None
+        self.last_spot_ts: Optional[int]      = None
         self.last_valid_tick_ts: Optional[int] = None
 
-        self.last_bid: Optional[float]       = None
-        self.last_ask: Optional[float]       = None
-        self.last_mid: Optional[float]       = None
-        self.last_spread_bp: Optional[float] = None
+        self.last_bid: Optional[float]        = None
+        self.last_ask: Optional[float]        = None
+        self.last_mid: Optional[float]        = None
+        self.last_spread_bp: Optional[float]  = None
 
         # Counters incrementales heartbeat
-        self.hb_prev_raw_spots               = 0
-        self.hb_prev_valid_ticks             = 0
-        self.hb_prev_reject_spread           = 0
-        self.hb_prev_reject_not_ready        = 0
-        self.hb_prev_ts_fallbacks            = 0
+        self.hb_prev_raw_spots                = 0
+        self.hb_prev_valid_ticks              = 0
+        self.hb_prev_reject_spread            = 0
+        self.hb_prev_reject_not_ready         = 0
+        self.hb_prev_ts_fallbacks             = 0
 
         self.last_local_closed_bar: Optional[dict] = None
         self.pending_broker_h1_fetch = False
@@ -313,7 +330,7 @@ class BotState:
             self.bars.pop(0)
 
     def n_bars_needed(self):
-        return max(EMA_SLOW_N, ADX_PERIOD * 3)
+        return max(EMA_SLOW_N, ADX_PERIOD * 3, SMA_DEPTH_N + SWING_LOOKBACK + 2)
 
     def is_warmed_up(self):
         return self.n_bars >= self.n_bars_needed()
@@ -363,10 +380,6 @@ def get_bar_start(ts):
     return (ts // BAR_SECONDS) * BAR_SECONDS
 
 def normalize_spot_timestamp(raw_ts_ms: Optional[int]) -> int:
-    """
-    Convierte timestamp spot a segundos UTC.
-    Si viene 0, invalido o fuera de rango, usa fallback con hora local UTC actual.
-    """
     now_ts = now_utc_ts()
 
     try:
@@ -382,7 +395,6 @@ def normalize_spot_timestamp(raw_ts_ms: Optional[int]) -> int:
 
         ts = raw_ts_ms // 1000
 
-        # Rango razonable: entre 2000-01-01 y ahora + 1h
         if ts < 946684800 or ts > now_ts + 3600:
             state.spot_ts_fallback_count += 1
             return now_ts
@@ -410,7 +422,6 @@ def normalize_price_field(x):
     if math.isnan(px) or px <= 0:
         return 0.0
 
-    # Si viniera escalado estilo 118084, convertirlo a 1.18084
     if px > 100:
         return px / 100000.0
 
@@ -433,6 +444,11 @@ def ema_series(values, span):
     for v in values[1:]:
         ema = v * k + ema * (1 - k)
     return ema
+
+def sma_last(values, n):
+    if len(values) < n:
+        return float("nan")
+    return float(np.mean(values[-n:]))
 
 def calc_atr(bars, period):
     if len(bars) < period + 1:
@@ -494,6 +510,25 @@ def calc_adx(bars, period):
 
     return adx
 
+def compute_pullback_depth_vs_sma10_bp(sma10, swing_lo, swing_hi):
+    """
+    Feature live construido directamente para el setup:
+      long  -> profundidad = SMA10 - swing_lo_prev
+      short -> profundidad = swing_hi_prev - SMA10
+
+    Se devuelve en bp respecto a SMA10.
+    """
+    out_long = float("nan")
+    out_short = float("nan")
+
+    if sma10 is not None and sma10 > 0:
+        if swing_lo is not None and not math.isnan(swing_lo):
+            out_long = px_to_bp(max(0.0, sma10 - swing_lo), sma10)
+        if swing_hi is not None and not math.isnan(swing_hi):
+            out_short = px_to_bp(max(0.0, swing_hi - sma10), sma10)
+
+    return out_long, out_short
+
 def compute_indicators():
     bars = state.bars
     n = len(bars)
@@ -508,15 +543,20 @@ def compute_indicators():
         "adx": nan,
         "swing_hi": nan,
         "swing_lo": nan,
-        "swing_range_bp": nan
+        "swing_range_bp": nan,
+        "sma10": nan,
+        "pullback_depth_long_bp": nan,
+        "pullback_depth_short_bp": nan,
     }
 
     if n < state.n_bars_needed():
         return r
 
     closes = [b["close"] for b in bars]
+
     r["ema_fast"] = ema_series(closes[-EMA_FAST_N:], EMA_FAST_N)
     r["ema_slow"] = ema_series(closes[-EMA_SLOW_N:], EMA_SLOW_N)
+    r["sma10"] = sma_last(closes, SMA_DEPTH_N)
 
     if not math.isnan(r["ema_fast"]) and not math.isnan(r["ema_slow"]):
         r["ltf_side"] = 1 if r["ema_fast"] > r["ema_slow"] else -1
@@ -533,18 +573,31 @@ def compute_indicators():
         r["swing_lo"] = min(b["low"]  for b in prev)
         r["swing_range_bp"] = px_to_bp(r["swing_hi"] - r["swing_lo"], mid)
 
+    if not math.isnan(r["sma10"]) and not math.isnan(r["swing_lo"]) and not math.isnan(r["swing_hi"]):
+        d_long, d_short = compute_pullback_depth_vs_sma10_bp(
+            r["sma10"], r["swing_lo"], r["swing_hi"]
+        )
+        r["pullback_depth_long_bp"] = d_long
+        r["pullback_depth_short_bp"] = d_short
+
     return r
 
 # =============================================================================
-# LOGICA BOS (SIN CAMBIAR ESTRATEGIA)
+# LOGICA BOS + RESEARCH FILTER
 # =============================================================================
 
 def evaluate_bos_signal(ind, bar):
     close = bar["close"]
 
-    for key in ["ema_fast", "ema_slow", "atr_bp", "adx", "swing_hi", "swing_lo", "swing_range_bp"]:
+    for key in [
+        "ema_fast", "ema_slow", "atr_bp", "adx",
+        "swing_hi", "swing_lo", "swing_range_bp",
+        "sma10", "pullback_depth_long_bp", "pullback_depth_short_bp"
+    ]:
         if math.isnan(ind.get(key, float("nan"))):
-            return None
+            if REQUIRE_DEPTH_FEATURE_READY:
+                return None
+            break
 
     if ind["swing_range_bp"] < MIN_SWING_BP:
         return None
@@ -563,16 +616,45 @@ def evaluate_bos_signal(ind, bar):
 
     ltf = ind["ltf_side"]
 
-    # Estrategia original: reversal del breakout
+    candidate_side = None
+    setup_depth_bp = float("nan")
+
     if ltf == 1 and close > ind["swing_hi"]:
-        log.info(f"  BOS ALCISTA: {close:.5f} > swing_hi={ind['swing_hi']:.5f}")
-        return "buy"
+        candidate_side = "buy"
+        setup_depth_bp = ind["pullback_depth_long_bp"]
 
-    if ltf == -1 and close < ind["swing_lo"]:
-        log.info(f"  BOS BAJISTA: {close:.5f} < swing_lo={ind['swing_lo']:.5f}")
-        return "sell"
+    elif ltf == -1 and close < ind["swing_lo"]:
+        candidate_side = "sell"
+        setup_depth_bp = ind["pullback_depth_short_bp"]
 
-    return None
+    if candidate_side is None:
+        return None
+
+    if USE_EXCLUDE_DEPTH_Q4_FILTER:
+        if math.isnan(setup_depth_bp):
+            log.info("  SETUP RECHAZADO: depth feature no disponible")
+            return None
+
+        if setup_depth_bp > DEPTH_Q75_BP:
+            log.info(
+                f"  SETUP RECHAZADO POR exclude_depth_q4 | side={candidate_side.upper()} | "
+                f"setup_depth_bp={setup_depth_bp:.2f} > q75={DEPTH_Q75_BP:.2f}"
+            )
+            return None
+
+    log.info(
+        f"  BOS {candidate_side.upper()} ACEPTADO | "
+        f"close={close:.5f} | swing_hi={ind['swing_hi']:.5f} | swing_lo={ind['swing_lo']:.5f} | "
+        f"sma10={ind['sma10']:.5f} | setup_depth_bp={setup_depth_bp:.2f}"
+    )
+
+    return {
+        "side": candidate_side,
+        "setup_depth_bp": setup_depth_bp,
+        "sma10": ind["sma10"],
+        "swing_hi": ind["swing_hi"],
+        "swing_lo": ind["swing_lo"],
+    }
 
 # =============================================================================
 # RIESGO / SIZING / SLTP
@@ -603,7 +685,8 @@ def calc_units(sl_bp, entry_price):
     margin = units * entry_price / LEVERAGE
     return units, margin
 
-def execute_signal(signal, bar, ind, bot):
+def execute_signal(signal_info, bar, ind, bot):
+    signal = signal_info["side"]
     entry = bar["ask"] if signal == "buy" else bar["bid"]
 
     sl_price, tp_price, sl_bp, tp_bp = calc_sl_tp(signal, entry, ind["atr_bp"])
@@ -621,9 +704,12 @@ def execute_signal(signal, bar, ind, bot):
         return
 
     spread_bp = px_to_bp((bar["ask"] - bar["bid"]), bar["bid"])
+
     log.info(
         f"\n  *** {signal.upper()} PRE-ORDER | "
         f"EntryRef={entry:.5f} | Spread={spread_bp:.2f}bp | "
+        f"SMA10={signal_info.get('sma10', float('nan')):.5f} | "
+        f"SetupDepth={signal_info.get('setup_depth_bp', float('nan')):.2f}bp | "
         f"SL={sl_price:.5f} ({sl_bp:.1f}bp) | "
         f"TP={tp_price:.5f} ({tp_bp:.1f}bp) | "
         f"Units={units:,} | Margen={margin_needed:.0f}€ ***"
@@ -640,6 +726,10 @@ def execute_signal(signal, bar, ind, bot):
         "signal_bar_time": bar["time"],
         "signal_bid": bar["bid"],
         "signal_ask": bar["ask"],
+        "setup_depth_bp": signal_info.get("setup_depth_bp"),
+        "sma10": signal_info.get("sma10"),
+        "swing_hi": signal_info.get("swing_hi"),
+        "swing_lo": signal_info.get("swing_lo"),
     }
 
     state.last_bos_bar = state.n_bars
@@ -717,8 +807,6 @@ def on_tick(bid, ask, ts, bot):
         state.current_bar_valid_ticks += 1
 
     else:
-        # Si usamos barra broker para señal, NO rotamos aquí.
-        # Esperamos a que el timer UTC cierre la barra anterior y cree la nueva.
         if USE_BROKER_H1_FOR_SIGNAL:
             return
 
@@ -735,8 +823,6 @@ def on_tick(bid, ask, ts, bot):
             "ask": ask,
         }
         state.current_bar_valid_ticks = 1
-
-
 
 def on_bar_close(bar, bot):
     to_close = []
@@ -757,15 +843,22 @@ def on_bar_close(bar, bot):
 
     ind = compute_indicators()
     side_str = "▲UP" if ind["ltf_side"] == 1 else "▼DOWN"
+
     log.info(
         f"  EMA_f={ind['ema_fast']:.5f} EMA_s={ind['ema_slow']:.5f} {side_str} | "
-        f"ATR={ind['atr_bp']:.1f}bp | ADX={ind['adx']:.1f} | "
+        f"SMA10={ind['sma10']:.5f} | ATR={ind['atr_bp']:.1f}bp | ADX={ind['adx']:.1f} | "
         f"Swing [{ind['swing_lo']:.5f}-{ind['swing_hi']:.5f}] ({ind['swing_range_bp']:.1f}bp)"
     )
+    log.info(
+        f"  DEPTH FEATURE | long={ind['pullback_depth_long_bp']:.2f}bp | "
+        f"short={ind['pullback_depth_short_bp']:.2f}bp | q75={DEPTH_Q75_BP:.2f}bp | "
+        f"filter={'ON' if USE_EXCLUDE_DEPTH_Q4_FILTER else 'OFF'}"
+    )
 
-    signal = evaluate_bos_signal(ind, bar)
-    if signal:
-        execute_signal(signal, bar, ind, bot)
+    signal_info = evaluate_bos_signal(ind, bar)
+
+    if signal_info:
+        execute_signal(signal_info, bar, ind, bot)
     else:
         reasons = []
         if not math.isnan(ind["atr_bp"]) and ind["atr_bp"] < ATR_MIN_BP:
@@ -776,6 +869,22 @@ def on_bar_close(bar, bot):
             reasons.append(f"swing={ind['swing_range_bp']:.1f}bp<{MIN_SWING_BP}")
         if state.bars_since_last_bos < COOLDOWN_BARS:
             reasons.append("cooldown")
+
+        close = bar["close"]
+        bos_buy = (ind["ltf_side"] == 1 and close > ind["swing_hi"]) if not math.isnan(ind["swing_hi"]) else False
+        bos_sell = (ind["ltf_side"] == -1 and close < ind["swing_lo"]) if not math.isnan(ind["swing_lo"]) else False
+
+        if bos_buy:
+            reasons.append(
+                f"BOS_buy_rejected depth={ind['pullback_depth_long_bp']:.2f}bp"
+                if ind["pullback_depth_long_bp"] > DEPTH_Q75_BP else "BOS_buy_rejected"
+            )
+        elif bos_sell:
+            reasons.append(
+                f"BOS_sell_rejected depth={ind['pullback_depth_short_bp']:.2f}bp"
+                if ind["pullback_depth_short_bp"] > DEPTH_Q75_BP else "BOS_sell_rejected"
+            )
+
         if not reasons:
             reasons.append("sin BOS")
 
@@ -862,9 +971,9 @@ class BosBot:
         self.account_auth_timeout_call = None
         self.reconnect_call = None
         self.shutting_down = False
-        self.manual_disconnect_in_progress=False
+        self.manual_disconnect_in_progress = False
 
-        log.info(f"Bot v6 inicializado | Servidor: {host}")
+        log.info(f"Bot v7 inicializado | Servidor: {host}")
 
     def _connect(self):
         self.client.startService()
@@ -1382,7 +1491,8 @@ class BosBot:
                     f"[{now}] SISTEMA | READY | bars={state.n_bars} | trades={state.n_open_trades} "
                     f"| pnl={state.pnl_bp_total:+.1f}bp | margin={state.total_margin_used:.0f}/{state.equity*MAX_MARGIN_PCT:.0f}€ "
                     f"| ATR={ind['atr_bp']:.1f}bp | ADX={ind['adx']:.1f} | swing={ind['swing_range_bp']:.1f}bp "
-                    f"| side={side_txt} | WR={wr:.0f}%"
+                    f"| SMA10={ind['sma10']:.5f} | depthL={ind['pullback_depth_long_bp']:.2f}bp "
+                    f"| depthS={ind['pullback_depth_short_bp']:.2f}bp | side={side_txt} | WR={wr:.0f}%"
                 )
             else:
                 faltan = needed - state.n_bars
@@ -1394,11 +1504,9 @@ class BosBot:
             if flags:
                 log.warning(f"[{now}] AVISO_FEED | {' | '.join(flags)}")
 
-            # guardar estado para dashboard
             save_state()
             append_history()
 
-            # Reconcile periodico para capturar cierres SL/TP no detectados por execution event
             self._reconcile()
 
             reactor.callLater(HEARTBEAT_SECS, heartbeat)
@@ -1494,9 +1602,7 @@ class BosBot:
                 log.warning("No se pudieron parsear barras historicas validas.")
                 return
 
-            # -------------------------------------------------------------
-            # CASO 1: fetch horario post-cierre para comparar barra broker
-            # -------------------------------------------------------------
+            # fetch horario post-cierre
             if state.pending_broker_h1_fetch:
                 state.pending_broker_h1_fetch = False
 
@@ -1531,20 +1637,16 @@ class BosBot:
                 if USE_BROKER_H1_FOR_SIGNAL:
                     log.info("USANDO H1 BROKER PARA SEÑAL")
 
-                    # sustituir última barra local por broker
                     if state.bars and state.bars[-1]["time"] == broker_last_closed["time"]:
                         state.bars[-1] = broker_last_closed
                     else:
                         state.add_bar(broker_last_closed)
 
-                    # ejecutar lógica con barra broker
                     on_bar_close(broker_last_closed, self)
 
                 return
 
-            # -------------------------------------------------------------
-            # CASO 2: carga inicial / precarga historica normal
-            # -------------------------------------------------------------
+            # carga inicial
             state.bars = []
             for bar in dedup[-state.max_bars:]:
                 state.add_bar(bar)
@@ -1571,6 +1673,9 @@ class BosBot:
                     log.info(
                         f"  Estado actual: ATR={ind['atr_bp']:.1f}bp | ADX={ind['adx']:.1f} | "
                         f"Lado={'UP' if ind['ltf_side']==1 else 'DOWN'} | "
+                        f"SMA10={ind['sma10']:.5f} | "
+                        f"DepthL={ind['pullback_depth_long_bp']:.2f}bp | "
+                        f"DepthS={ind['pullback_depth_short_bp']:.2f}bp | "
                         f"Swing={ind['swing_range_bp']:.1f}bp"
                     )
             else:
@@ -1643,13 +1748,6 @@ class BosBot:
 
         trade = state.open_trades.pop(pos_id)
 
-        # ---------------------------------------------------------
-        # Elegir precio de cierre
-        # 1) usar close_price si viene bien informado (>0)
-        # 2) si no, usar fallback con bid/ask segun el lado
-        #    - buy cierra contra BID
-        #    - sell cierra contra ASK
-        # ---------------------------------------------------------
         if close_price is not None and not math.isnan(close_price) and close_price > 0:
             cp = close_price
             px_source = "event_price"
@@ -1665,10 +1763,7 @@ class BosBot:
                 cp = trade.entry_price
                 px_source = "entry_fallback"
 
-        pnl_bp = (
-                         ((trade.entry_price - cp) if trade.side == "sell" else (cp - trade.entry_price))
-                         / trade.entry_price
-                 ) * 10_000.0
+        pnl_bp = (((trade.entry_price - cp) if trade.side == "sell" else (cp - trade.entry_price)) / trade.entry_price) * 10_000.0
 
         state.pnl_bp_total += pnl_bp
 
@@ -1685,7 +1780,6 @@ class BosBot:
             f"WR={wr:.0f}% | Total={state.pnl_bp_total:+.1f}bp | Activos: {state.n_open_trades}"
         )
 
-        # Update inmediato dashboard
         save_state()
         append_history()
 
@@ -1743,7 +1837,6 @@ class BosBot:
             state._pending = None
             state.trades_total += 1
 
-            # Update inmediato dashboard
             save_state()
             append_history()
 
@@ -1774,7 +1867,6 @@ class BosBot:
         for p in server_positions:
             try:
                 server_open_ids.add(p.positionId)
-
                 log.info(
                     "RECONCILE_POS_DEBUG | "
                     f"positionId={getattr(p, 'positionId', None)} | "
@@ -1799,11 +1891,6 @@ class BosBot:
             f"Reconcile: server_open={len(server_open_ids)} | local_open={len(local_open_ids)}"
         )
 
-        # ---------------------------------------------------------
-        # 1) CIERRES PERDIDOS:
-        # posicion local ya no existe en servidor
-        # ---------------------------------------------------------
-        # Si una posicion local ya no existe en servidor, asumir cerrada
         missing_ids = local_open_ids - server_open_ids
 
         for pos_id in list(missing_ids):
@@ -1823,7 +1910,6 @@ class BosBot:
 
             self._finalize_trade_close(pos_id, fallback_close, reason="reconcile_missing")
 
-        # Si una posicion existe en broker pero no en estado local, recuperarla
         lost_open_ids = server_open_ids - local_open_ids
 
         for p in server_positions:
@@ -1844,7 +1930,6 @@ class BosBot:
             else:
                 side = "unknown"
 
-            # intentar desde tradeData (MUY IMPORTANTE en tu caso)
             if side == "unknown" and hasattr(p, "tradeData"):
                 td_side = getattr(p.tradeData, "tradeSide", None)
                 if td_side == ProtoOATradeSide.BUY:
@@ -1852,7 +1937,6 @@ class BosBot:
                 elif td_side == ProtoOATradeSide.SELL:
                     side = "sell"
 
-            # DEBUG FINAL: si sigue unknown
             if side == "unknown":
                 log.warning(f"Reconcile: side sigue siendo unknown | positionId={pos_id}")
 
@@ -1860,10 +1944,7 @@ class BosBot:
             if entry_price <= 0:
                 entry_price = state.last_mid if state.last_mid is not None else 0.0
 
-            # 1) intentar volume directo
             volume_raw = getattr(p, "volume", None)
-
-            # 2) fallback a tradeData.volume (AQUÍ está en tu caso)
             if (volume_raw is None or volume_raw == 0) and hasattr(p, "tradeData"):
                 volume_raw = getattr(p.tradeData, "volume", None)
 
@@ -1880,7 +1961,6 @@ class BosBot:
                 margin_used = margin_used_raw / (10 ** money_digits)
             else:
                 margin_used = calc_margin_for_units(units, entry_price)
-
 
             if math.isnan(margin_used) or margin_used <= 0:
                 margin_used = calc_margin_for_units(units, entry_price)
@@ -1903,7 +1983,6 @@ class BosBot:
             if tp_price > 0 and entry_price > 0:
                 tp_bp = abs(px_to_bp(tp_price - entry_price, entry_price))
 
-            # VALIDACION FINAL ENTRY PRICE
             if entry_price <= 0:
                 log.warning(f"Reconcile: entry_price invalido | positionId={pos_id}")
                 continue
@@ -1922,7 +2001,6 @@ class BosBot:
             )
 
             state.open_trades[pos_id] = recovered_trade
-            # IMPORTANTE: no incrementamos trades_total porque es una recuperación, no una apertura nueva
 
             log.warning(
                 f"  Reconcile recupera apertura perdida | "
@@ -1934,9 +2012,6 @@ class BosBot:
             save_state()
             append_history()
 
-
-
-        # actualizar dashboard si hubo cambios
         save_state()
 
     def send_order(self, side, units):
@@ -1946,8 +2021,8 @@ class BosBot:
         req.orderType = ProtoOAOrderType.MARKET
         req.tradeSide = ProtoOATradeSide.BUY if side == "buy" else ProtoOATradeSide.SELL
         req.volume = units * 100
-        req.comment = "BOS_v6"
-        req.label = f"BOSv6_{SYMBOL_NAME}_{side}"
+        req.comment = "BOS_v7_RESEARCH"
+        req.label = f"BOSv7_{SYMBOL_NAME}_{side}"
 
         self.client.send(req).addErrback(self._on_error)
 
@@ -1960,10 +2035,6 @@ class BosBot:
         req = ProtoOAAmendPositionSLTPReq()
         req.ctidTraderAccountId = ACCOUNT_ID
         req.positionId = position_id
-
-        # IMPORTANTE:
-        # En este endpoint stopLoss y takeProfit van como precios absolutos,
-        # no escalados por 100000.
         req.stopLoss = float(round(sl_price, 5))
         req.takeProfit = float(round(tp_price, 5))
 
@@ -2000,17 +2071,24 @@ class BosBot:
 
 def main():
     log.info("=" * 78)
-    log.info("EURUSD BOS REVERSAL BOT v6")
+    log.info("EURUSD BOS REVERSAL BOT v7 — RESEARCH DEPTH FILTER")
     log.info("=" * 78)
     log.info(f"  Cuenta: {ACCOUNT_ID} ({'DEMO' if USE_DEMO else 'LIVE'})")
     log.info(f"  Symbol: {SYMBOL_NAME} | symbolId fallback={DEFAULT_SYMBOL_ID}")
-    log.info(f"  Filtros: ATR>={ATR_MIN_BP}bp + ADX>={ADX_MIN_VAL}")
+    log.info(f"  Filtros base: ATR>={ATR_MIN_BP}bp + ADX>={ADX_MIN_VAL}")
     log.info(f"  Swing lookback: {SWING_LOOKBACK} barras | swing min={MIN_SWING_BP}bp")
     log.info(f"  SL: ATR*{ATR_MULT} clip[{SL_MIN_BP}-{SL_MAX_BP}bp] | TP: {TP_RATIO}:1")
     log.info(f"  Riesgo: {RISK_PCT*100:.1f}% | MarginCap: {MAX_MARGIN_PCT*100:.0f}%")
     log.info(f"  Spread max: {MAX_SPREAD_BP:.1f}bp")
     log.info(f"  Heartbeat: cada {HEARTBEAT_SECS}s")
     log.info(f"  Precarga historica: hasta {HISTORICAL_BARS} barras H1 | lookback {HISTORICAL_LOOKBACK_DAYS} dias")
+    log.info("-" * 78)
+    log.info("  RESEARCH FILTER LIVE:")
+    log.info(f"    USE_EXCLUDE_DEPTH_Q4_FILTER = {USE_EXCLUDE_DEPTH_Q4_FILTER}")
+    log.info(f"    SMA_DEPTH_N = {SMA_DEPTH_N}")
+    log.info(f"    DEPTH_Q75_BP = {DEPTH_Q75_BP:.4f}")
+    log.info("    Feature long  = bp(SMA10 - swing_lo_prev)")
+    log.info("    Feature short = bp(swing_hi_prev - SMA10)")
     log.info("=" * 78)
     BosBot().start()
 
