@@ -227,6 +227,7 @@ class OpenTrade:
     tp_bp:         float
     units:         int
     entry_bar_idx: int
+    entry_bar_seq: int
     margin_used:   float
     entry_time:    datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     sltp_sent:     bool = False
@@ -239,6 +240,7 @@ class BotState:
     def __init__(self):
         self.bars: List[dict]                = []
         self.max_bars                        = 200
+        self.closed_bars_total = 0
 
         self.current_bar: Optional[dict]     = None
         self.current_bar_start: Optional[int] = None
@@ -654,6 +656,7 @@ def execute_signal(signal, bar, ind, bot):
         "units": units,
         "margin": margin_needed,
         "entry_bar_idx": state.n_bars,
+        "entry_bar_seq": state.closed_bars_total,
         "signal_bar_time": bar["time"],
         "signal_bid": bar["bid"],
         "signal_ask": bar["ask"],
@@ -676,6 +679,7 @@ def finalize_current_bar(bot):
         return
 
     state.add_bar(completed)
+    state.closed_bars_total += 1
     state.last_local_closed_bar = completed
     bar_dt = datetime.fromtimestamp(completed["time"], tz=timezone.utc)
 
@@ -758,7 +762,13 @@ def on_tick(bid, ask, ts, bot):
 def on_bar_close(bar, bot):
     to_close = []
     for pid, trade in state.open_trades.items():
-        bars_open = state.n_bars - trade.entry_bar_idx
+        bars_open = state.closed_bars_total - trade.entry_bar_seq
+        bars_open = max(0, bars_open)
+
+        log.info(
+            f"  HORIZON_CHECK | positionId={pid} | bars_open={bars_open} | max={MAX_BARS_OPEN}"
+        )
+
         if bars_open >= MAX_BARS_OPEN:
             log.warning(f"  Trade {pid}: horizonte max ({MAX_BARS_OPEN}h) — cerrando")
             to_close.append(pid)
@@ -898,6 +908,7 @@ class BosBot:
 
     def _reset_market_state(self):
         state.bars = []
+        state.closed_bars_total = 0
         state.current_bar = None
         state.current_bar_start = None
         state.current_bar_valid_ticks = 0
@@ -1571,6 +1582,7 @@ class BosBot:
             for bar in dedup[-state.max_bars:]:
                 state.add_bar(bar)
 
+            state.closed_bars_total = len(state.bars)
             state.historical_loaded = True
 
             fallback_close = dedup[-1]["close"]
@@ -1760,6 +1772,7 @@ class BosBot:
                 tp_bp=tp_bp,
                 units=p["units"],
                 entry_bar_idx=p["entry_bar_idx"],
+                entry_bar_seq=p.get("entry_bar_seq", state.closed_bars_total),
                 margin_used=p["margin"],
             )
 
@@ -1968,6 +1981,7 @@ class BosBot:
                 tp_bp=tp_bp,
                 units=units,
                 entry_bar_idx=state.n_bars,
+                entry_bar_seq=state.closed_bars_total,
                 margin_used=margin_used,
             )
 
