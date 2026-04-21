@@ -1335,106 +1335,107 @@ class BosBot:
 
     def _start_heartbeat(self):
         def heartbeat():
-            now = datetime.now(timezone.utc).strftime("%H:%M:%S")
-            needed = state.n_bars_needed()
+            try:
+                now = datetime.now(timezone.utc).strftime("%H:%M:%S")
+                needed = state.n_bars_needed()
 
-            hb_raw = state.raw_spot_count - state.hb_prev_raw_spots
-            hb_valid = state.tick_count - state.hb_prev_valid_ticks
-            hb_rej_spread = state.spot_reject_spread - state.hb_prev_reject_spread
-            hb_rej_not_ready = state.spot_reject_not_ready - state.hb_prev_reject_not_ready
-            hb_ts_fallbacks = state.spot_ts_fallback_count - state.hb_prev_ts_fallbacks
+                hb_raw = state.raw_spot_count - state.hb_prev_raw_spots
+                hb_valid = state.tick_count - state.hb_prev_valid_ticks
+                hb_rej_spread = state.spot_reject_spread - state.hb_prev_reject_spread
+                hb_rej_not_ready = state.spot_reject_not_ready - state.hb_prev_reject_not_ready
+                hb_ts_fallbacks = state.spot_ts_fallback_count - state.hb_prev_ts_fallbacks
 
-            state.hb_prev_raw_spots = state.raw_spot_count
-            state.hb_prev_valid_ticks = state.tick_count
-            state.hb_prev_reject_spread = state.spot_reject_spread
-            state.hb_prev_reject_not_ready = state.spot_reject_not_ready
-            state.hb_prev_ts_fallbacks = state.spot_ts_fallback_count
+                state.hb_prev_raw_spots = state.raw_spot_count
+                state.hb_prev_valid_ticks = state.tick_count
+                state.hb_prev_reject_spread = state.spot_reject_spread
+                state.hb_prev_reject_not_ready = state.spot_reject_not_ready
+                state.hb_prev_ts_fallbacks = state.spot_ts_fallback_count
 
-            now_ts = now_utc_ts()
-            secs_since_last_spot = None if state.last_spot_ts is None else now_ts - state.last_spot_ts
-            secs_since_last_valid = None if state.last_valid_tick_ts is None else now_ts - state.last_valid_tick_ts
+                now_ts = now_utc_ts()
+                secs_since_last_spot = None if state.last_spot_ts is None else now_ts - state.last_spot_ts
+                secs_since_last_valid = None if state.last_valid_tick_ts is None else now_ts - state.last_valid_tick_ts
 
-            prox_bar_txt = ""
-            if state.current_bar_start is not None:
-                prox = state.current_bar_start + BAR_SECONDS
-                secs_left = prox - now_ts
-                prox_bar_txt = f"{max(0, secs_left//60)}m{max(0, secs_left%60)}s"
+                prox_bar_txt = ""
+                if state.current_bar_start is not None:
+                    prox = state.current_bar_start + BAR_SECONDS
+                    secs_left = prox - now_ts
+                    prox_bar_txt = f"{max(0, secs_left // 60)}m{max(0, secs_left % 60)}s"
 
-            mid_live = state.last_mid if state.last_mid is not None else 0.0
-            bid_live = state.last_bid if state.last_bid is not None else 0.0
-            ask_live = state.last_ask if state.last_ask is not None else 0.0
-            spread_live = state.last_spread_bp if state.last_spread_bp is not None else float("nan")
+                mid_live = state.last_mid if state.last_mid is not None else 0.0
+                bid_live = state.last_bid if state.last_bid is not None else 0.0
+                ask_live = state.last_ask if state.last_ask is not None else 0.0
+                spread_live = state.last_spread_bp if state.last_spread_bp is not None else float("nan")
 
-            if state.current_bar is not None:
-                cb = state.current_bar
-                bar_txt = (
-                    f"O={cb['open']:.5f} H={cb['high']:.5f} "
-                    f"L={cb['low']:.5f} C={cb['close']:.5f} "
-                    f"| ticks_bar={state.current_bar_valid_ticks}"
-                )
-                bar_age = now_ts - state.current_bar_start
-                bar_age_txt = f"{bar_age//60}m{bar_age%60}s"
-            else:
-                bar_txt = "sin barra actual"
-                bar_age_txt = "NA"
+                if state.current_bar is not None:
+                    cb = state.current_bar
+                    bar_txt = (
+                        f"O={cb['open']:.5f} H={cb['high']:.5f} "
+                        f"L={cb['low']:.5f} C={cb['close']:.5f} "
+                        f"| ticks_bar={state.current_bar_valid_ticks}"
+                    )
+                    bar_age = now_ts - state.current_bar_start
+                    bar_age_txt = f"{bar_age // 60}m{bar_age % 60}s"
+                else:
+                    bar_txt = "sin barra actual"
+                    bar_age_txt = "NA"
 
-            flags = []
-            if secs_since_last_spot is not None and secs_since_last_spot > 10:
-                flags.append(f"ultimo_spot_hace_{secs_since_last_spot}s")
-            if secs_since_last_valid is not None and secs_since_last_valid > 10:
-                flags.append(f"ultimo_tick_valido_hace_{secs_since_last_valid}s")
-            if not math.isnan(spread_live) and spread_live > MAX_SPREAD_BP:
-                flags.append(f"spread_alto={spread_live:.2f}bp")
+                flags = []
+                if secs_since_last_spot is not None and secs_since_last_spot > 10:
+                    flags.append(f"ultimo_spot_hace_{secs_since_last_spot}s")
+                if secs_since_last_valid is not None and secs_since_last_valid > 10:
+                    flags.append(f"ultimo_tick_valido_hace_{secs_since_last_valid}s")
+                if not math.isnan(spread_live) and spread_live > MAX_SPREAD_BP:
+                    flags.append(f"spread_alto={spread_live:.2f}bp")
 
-
-            log.info(
-                f"[{now}] FEED | bid={bid_live:.5f} ask={ask_live:.5f} mid={mid_live:.5f} "
-                f"| spread={spread_live:.2f}bp | raw_spots(+30s)={hb_raw} "
-                f"| valid_ticks(+30s)={hb_valid} | rej_spread(+30s)={hb_rej_spread} "
-                f"| rej_not_ready(+30s)={hb_rej_not_ready} | ts_fallbacks_total={state.spot_ts_fallback_count} "
-                f"| last_spot={secs_since_last_spot if secs_since_last_spot is not None else 'NA'}s "
-                f"| last_valid={secs_since_last_valid if secs_since_last_valid is not None else 'NA'}s"
-            )
-
-            if hb_ts_fallbacks > 0:
                 log.info(
-                    f"[{now}] FEED_TS | ts_fallbacks(+30s)={hb_ts_fallbacks} | "
-                    f"usando reloj local UTC para fechar spots"
+                    f"[{now}] FEED | bid={bid_live:.5f} ask={ask_live:.5f} mid={mid_live:.5f} "
+                    f"| spread={spread_live:.2f}bp | raw_spots(+30s)={hb_raw} "
+                    f"| valid_ticks(+30s)={hb_valid} | rej_spread(+30s)={hb_rej_spread} "
+                    f"| rej_not_ready(+30s)={hb_rej_not_ready} | ts_fallbacks_total={state.spot_ts_fallback_count} "
+                    f"| last_spot={secs_since_last_spot if secs_since_last_spot is not None else 'NA'}s "
+                    f"| last_valid={secs_since_last_valid if secs_since_last_valid is not None else 'NA'}s"
                 )
 
-            log.info(
-                f"[{now}] BARRA | start={fmt_dt_utc(state.current_bar_start)} | age={bar_age_txt} "
-                f"| prox_cierre={prox_bar_txt} | {bar_txt}"
-            )
+                if hb_ts_fallbacks > 0:
+                    log.info(
+                        f"[{now}] FEED_TS | ts_fallbacks(+30s)={hb_ts_fallbacks} | "
+                        f"usando reloj local UTC para fechar spots"
+                    )
 
-            if state.is_warmed_up():
-                ind = compute_indicators()
-                side_txt = "UP" if ind["ltf_side"] == 1 else "DOWN"
-                wr = state.trades_win / max(state.trades_total, 1) * 100
                 log.info(
-                    f"[{now}] SISTEMA | READY | bars={state.n_bars} | trades={state.n_open_trades} "
-                    f"| pnl={state.pnl_bp_total:+.1f}bp | margin={state.total_margin_used:.0f}/{state.equity*MAX_MARGIN_PCT:.0f}€ "
-                    f"| ATR={ind['atr_bp']:.1f}bp | ADX={ind['adx']:.1f} | swing={ind['swing_range_bp']:.1f}bp "
-                    f"| side={side_txt} | WR={wr:.0f}%"
-                )
-            else:
-                faltan = needed - state.n_bars
-                log.info(
-                    f"[{now}] SISTEMA | CALENTANDO {state.n_bars}/{needed} | faltan={faltan} barras "
-                    f"| trades={state.n_open_trades} | pnl={state.pnl_bp_total:+.1f}bp"
+                    f"[{now}] BARRA | start={fmt_dt_utc(state.current_bar_start)} | age={bar_age_txt} "
+                    f"| prox_cierre={prox_bar_txt} | {bar_txt}"
                 )
 
-            if flags:
-                log.warning(f"[{now}] AVISO_FEED | {' | '.join(flags)}")
+                if state.is_warmed_up():
+                    ind = compute_indicators()
+                    side_txt = "UP" if ind["ltf_side"] == 1 else "DOWN"
+                    wr = state.trades_win / max(state.trades_total, 1) * 100
+                    log.info(
+                        f"[{now}] SISTEMA | READY | bars={state.n_bars} | trades={state.n_open_trades} "
+                        f"| pnl={state.pnl_bp_total:+.1f}bp | margin={state.total_margin_used:.0f}/{state.equity * MAX_MARGIN_PCT:.0f}€ "
+                        f"| ATR={ind['atr_bp']:.1f}bp | ADX={ind['adx']:.1f} | swing={ind['swing_range_bp']:.1f}bp "
+                        f"| side={side_txt} | WR={wr:.0f}%"
+                    )
+                else:
+                    faltan = needed - state.n_bars
+                    log.info(
+                        f"[{now}] SISTEMA | CALENTANDO {state.n_bars}/{needed} | faltan={faltan} barras "
+                        f"| trades={state.n_open_trades} | pnl={state.pnl_bp_total:+.1f}bp"
+                    )
 
-            # guardar estado para dashboard
-            save_state()
-            append_history()
+                if flags:
+                    log.warning(f"[{now}] AVISO_FEED | {' | '.join(flags)}")
 
-            # Reconcile periodico para capturar cierres SL/TP no detectados por execution event
-            self._reconcile()
+                save_state()
+                append_history()
+                self._reconcile()
 
-            reactor.callLater(HEARTBEAT_SECS, heartbeat)
+            except Exception as e:
+                log.error(f"Error en heartbeat: {e}", exc_info=True)
+
+            finally:
+                reactor.callLater(HEARTBEAT_SECS, heartbeat)
 
         reactor.callLater(HEARTBEAT_SECS, heartbeat)
         log.info(f"Heartbeat activo (cada {HEARTBEAT_SECS}s)")
